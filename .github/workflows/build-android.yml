@@ -7,22 +7,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup xmake
-        uses: xmake-io/github-action-setup-xmake@v1
+      - name: Clone Dobby
+        run: |
+          git clone --depth 1 https://github.com/jmpews/Dobby.git vendor/dobby
+          echo "Dobby cloned: $(ls vendor/dobby/)"
 
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
           ndk-version: r28c
 
-      - name: Build
+      - name: Configure CMake
         run: |
-          xmake f -y -p android -a arm64-v8a -m release --ndk=${{ steps.ndk.outputs.ndk-path }}
-          xmake -y
+          mkdir -p build
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j$(nproc)
+
+      - name: Verify output
+        run: |
+          echo "=== Build output ==="
+          find build -name "*.so" -o -name "*.a" | head -20
+          SO_FILE=$(find build -name "libPersonalized.so" | head -1)
+          if [ -z "$SO_FILE" ]; then
+            echo "ERROR: libPersonalized.so not found!"
+            exit 1
+          fi
+          echo "Found: $SO_FILE"
+          file "$SO_FILE"
+          # Verify it's a valid ARM64 shared library
+          readelf -h "$SO_FILE" | grep -E "Machine|Type" || true
 
       - name: Upload Mod
         uses: actions/upload-artifact@v4
         with:
           name: Personalized-Android-Mod
-          path: build/android/arm64-v8a/release/libPersonalized.so
+          path: build/libPersonalized.so
           if-no-files-found: error

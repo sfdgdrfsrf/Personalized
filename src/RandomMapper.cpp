@@ -1,5 +1,5 @@
 #include "personalized/RandomMapper.hpp"
-#include <pl/Logger.hpp>
+#include <android/log.h>
 #include <cassert>
 
 namespace personalized {

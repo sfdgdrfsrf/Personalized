@@ -1,5 +1,7 @@
 #include "personalized/SeedManager.hpp"
-#include <pl/Logger.hpp>
+#include <android/log.h>
+
+#define LOG_TAG "Personalized"
 
 namespace personalized {
 
@@ -14,8 +16,8 @@ bool SeedManager::initializeWithUUID(const std::string& uuidStr) {
     m_uuidString = uuidStr;
     m_seed = deriveSeedFromUUID(uuidStr);
     m_initialized = true;
-    pl::log::Logger::getOrCreate("Personalized").info(
-        "SeedManager ready — UUID: {}, Seed: 0x{:016X}", m_uuidString, m_seed);
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+        "SeedManager ready — UUID: %s, Seed: 0x%016lX", m_uuidString.c_str(), (unsigned long)m_seed);
     return true;
 }
 
@@ -25,8 +27,8 @@ bool SeedManager::initializeWithFixedSeed(uint64_t seed) {
     m_seed = seed;
     m_uuidString = "FIXED";
     m_initialized = true;
-    pl::log::Logger::getOrCreate("Personalized").info(
-        "SeedManager ready — fixed seed: 0x{:016X}", m_seed);
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+        "SeedManager ready — fixed seed: 0x%016lX", (unsigned long)m_seed);
     return true;
 }
 
