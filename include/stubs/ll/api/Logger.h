@@ -50,16 +50,21 @@ private:
         std::fprintf(stderr, "[%s][%s] ", level, m_name.c_str());
     }
 
+    /// Convert std::string to const char* for printf; pass everything else through
+    static const char* cstr(const std::string& s) { return s.c_str(); }
+    static const char* cstr(const char* s)        { return s; }
+    template <typename T>
+    static T cstr(T v) { return v; }
+
     /// No-arg: print format string with placeholders stripped
     void log(const char* level, const char* fmt) {
         printPrefix(level);
         std::string out;
         for (const char* p = fmt; *p; ++p) {
             if (*p == '{') {
-                // Skip escaped {{
                 if (*(p+1) == '{') { out += '{'; ++p; continue; }
                 while (*p && *p != '}') ++p;
-                continue;  // skip closing }
+                continue;
             }
             if (*p == '}' && *(p+1) == '}') { out += '}'; ++p; continue; }
             out += *p;
@@ -67,46 +72,43 @@ private:
         std::fprintf(stderr, "%s\n", out.c_str());
     }
 
-    /// Variadic: convert fmtlib → printf and forward
+    /// Variadic: convert fmtlib → printf and forward, converting std::string→c_str
     template <typename... Args>
     void log(const char* level, const char* fmt, Args&&... args) {
         printPrefix(level);
         std::string pfmt = convertFmt(fmt);
-        std::fprintf(stderr, pfmt.c_str(), std::forward<Args>(args)...);
+        std::fprintf(stderr, pfmt.c_str(), cstr(std::forward<Args>(args))...);
         std::fputc('\n', stderr);
     }
 
     static std::string convertFmt(const char* fmt) {
         std::string result;
         for (const char* p = fmt; *p; ) {
-            // Escaped {{
             if (*p == '{' && *(p+1) == '{') { result += '{'; p += 2; continue; }
-            // Escaped }}
             if (*p == '}' && *(p+1) == '}') { result += '}'; p += 2; continue; }
 
             if (*p == '{') {
-                ++p; // skip {
+                ++p;
                 std::string spec;
                 while (*p && *p != '}') { spec += *p; ++p; }
-                if (*p == '}') ++p; // skip }
+                if (*p == '}') ++p;
 
-                // Map format spec to printf
                 if (spec.empty()) {
-                    result += "%s";         // {} → %s (string/generic)
+                    result += "%s";
                 } else if (spec == "d") {
-                    result += "%d";         // {:d} → %d
+                    result += "%d";
                 } else if (spec == "zu") {
-                    result += "%zu";        // {:zu} → %zu (size_t)
+                    result += "%zu";
                 } else if (spec == "p") {
-                    result += "%p";         // {:p} → %p
+                    result += "%p";
                 } else if (spec == "016X") {
-                    result += "%016llX";    // {:016X} → %016llX
+                    result += "%016llX";
                 } else if (spec == "016x") {
-                    result += "%016llx";    // {:016x} → %016llx
+                    result += "%016llx";
                 } else if (spec.size() >= 2 && spec[0] == '.') {
-                    result += "%" + spec;   // {:.0f} → %.0f, {:.2f} → %.2f
+                    result += "%" + spec;
                 } else {
-                    result += "%" + spec;   // fallback
+                    result += "%" + spec;
                 }
             } else {
                 result += *p;
