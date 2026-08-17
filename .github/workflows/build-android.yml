@@ -14,14 +14,16 @@ jobs:
           xmake-version: latest
 
       - name: Setup Android NDK
-        uses: android-actions/setup-android@v3
+        uses: ntttdk/setup-android-ndk@v1
+        id: setup-ndk
         with:
-          api-level: 30
-          ndk-version: '25.2.9519653'
+          ndk-version: r25c
 
       - name: Configure and Build
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          # -c = clean config cache, ensures fresh resolve
+          echo "ANDROID_NDK_ROOT = $ANDROID_NDK_ROOT"
           xmake f -c -p android -a arm64-v8a --ndk=$ANDROID_NDK_ROOT -m release -y
           xmake -y
 
