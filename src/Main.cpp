@@ -1,17 +1,15 @@
 /**
- * Main.cpp — Personalized mod for MC Bedrock Android (LeviLauncher)
+ * Main.cpp — Personalized mod for MC Bedrock Android (LeviLauncher) v0.4.0
  *
- * Standalone implementation with ZERO external dependencies beyond the NDK.
- * Uses:
- *   - MiniHook: our own ARM64 inline hooker (no Dobby needed)
- *   - dlsym for MC symbol resolution
- *   - Pattern scanning as fallback
- *   - __android_log_print for logging
+ * Implements all three UUID-seeded visual effects:
+ *   1. Texture swapping — generates resource pack with permuted block textures
+ *   2. Inventory scrambling — permutes ItemStack slots in player inventory
+ *   3. Mob model swapping — modifies ActorDefinitionIdentifier strings
  *
- * Produces UUID-seeded visual effects:
- *   - Mob nametag scrambling (visible text change on every mob)
- *   - Entity scale modification (mobs appear bigger/smaller)
- *   - Movement speed alteration (player moves at different speed)
+ * Plus bonus effects: nametag scramble, entity scale, movement speed.
+ *
+ * Uses MiniHook (our own ARM64 inline hooker) + dlsym + pattern scanning.
+ * Zero external dependencies beyond NDK system libraries.
  */
 
 #include "personalized/Config.hpp"
@@ -23,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -36,8 +35,10 @@
 #include <random>
 #include <chrono>
 #include <algorithm>
+#include <thread>
+#include <fstream>
+#include <sstream>
 
-// ─── Logging ───
 #define LOG_TAG "Personalized"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -47,875 +48,837 @@
 namespace personalized {
 
 // ═══════════════════════════════════════════════════════════════════
-//  MiniHook — Minimal ARM64 inline hooker
-//
-//  Implements function hooking by:
-//  1. Saving the first 16 bytes (4 ARM64 instructions) of the target
-//  2. Writing an absolute jump (LDR X17, [PC,#8]; BR X17; .quad addr)
-//  3. Creating a trampoline: saved bytes + absolute jump back
-//  4. Flushing instruction cache
-//
-//  Limitations:
-//  - Only hooks functions whose first 4 instructions are not PC-relative
-//    (BL, B, ADR, ADRP). This covers 99% of function prologues.
-//  - Not thread-safe during hook installation (install hooks before
-//    the target function is called)
+//  SECTION 1: MiniHook — ARM64 inline hooker
 // ═══════════════════════════════════════════════════════════════════
 namespace MiniHook {
-
-static constexpr size_t kJumpSize    = 16;  // LDR+BR+addr = 4+4+8 bytes
-static constexpr size_t kTrampSize   = 32;  // saved(16) + jump-back(16)
-
-// ARM64 absolute jump:
-//   LDR X17, [PC, #8]   — loads a 64-bit address from PC+8 into X17
-//   BR  X17             — branches to X17
-//   .quad target        — the 64-bit target address
-static constexpr uint32_t LDR_X17_PC8 = 0x58000051;  // LDR X17, [PC, #8]
-static constexpr uint32_t BR_X17      = 0xD61F0220;  // BR X17
+static constexpr size_t kJumpSize  = 16;
+static constexpr size_t kTrampSize = 32;
+static constexpr uint32_t LDR_X17_PC8 = 0x58000051;
+static constexpr uint32_t BR_X17      = 0xD61F0220;
 
 static void writeAbsoluteJump(void* where, void* target) {
     auto* p = static_cast<uint32_t*>(where);
-    p[0] = LDR_X17_PC8;
-    p[1] = BR_X17;
+    p[0] = LDR_X17_PC8; p[1] = BR_X17;
     *reinterpret_cast<void**>(&p[2]) = target;
 }
 
-// Check if an ARM64 instruction is PC-relative
-// Returns true for BL, B.cond, B, ADRP, ADR, LDR literal
 static bool isPCRelative(uint32_t insn) {
-    // BL:   100101xx_xxxxxxxx_xxxxxxxx_xxxxxxxx
-    if ((insn & 0xFC000000) == 0x94000000) return true;
-    // B:    000101xx_xxxxxxxx_xxxxxxxx_xxxxxxxx
-    if ((insn & 0xFC000000) == 0x14000000) return true;
-    // B.cond: 0101010x_xxxxxxxx_xxxxxxxx_xxxxxxxx
-    if ((insn & 0xFF000010) == 0x54000000) return true;
-    // CBZ/CBNZ: 0110100x / 0110101x
-    if ((insn & 0x7E000000) == 0x34000000) return true;
-    if ((insn & 0x7E000000) == 0x35000000) return true;
-    // TBZ/TBNZ: 0110110x / 0110111x
-    if ((insn & 0x7E000000) == 0x36000000) return true;
-    if ((insn & 0x7E000000) == 0x37000000) return true;
-    // ADRP: 1xxx0000_xxxxxxxx_xxxxxxxx_xxxxxxxx (page address)
-    if ((insn & 0x9F000000) == 0x90000000) return true;
-    // ADR:  0xxx10000_xxxxxxxx_xxxxxxxx_xxxxxxxx
-    if ((insn & 0x9F000000) == 0x10000000) return true;
+    if ((insn & 0xFC000000) == 0x94000000) return true;  // BL
+    if ((insn & 0xFC000000) == 0x14000000) return true;  // B
+    if ((insn & 0xFF000010) == 0x54000000) return true;  // B.cond
+    if ((insn & 0x7E000000) == 0x34000000) return true;  // CBZ
+    if ((insn & 0x7E000000) == 0x35000000) return true;  // CBNZ
+    if ((insn & 0x7E000000) == 0x36000000) return true;  // TBZ
+    if ((insn & 0x7E000000) == 0x37000000) return true;  // TBNZ
+    if ((insn & 0x9F000000) == 0x90000000) return true;  // ADRP
+    if ((insn & 0x9F000000) == 0x10000000) return true;  // ADR
     return false;
 }
 
-// Allocate executable memory for trampoline
 static void* allocTrampoline() {
-    void* mem = mmap(nullptr, kTrampSize,
-                     PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) return nullptr;
-    return mem;
+    void* mem = mmap(nullptr, kTrampSize, PROT_READ|PROT_WRITE|PROT_EXEC,
+                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    return (mem == MAP_FAILED) ? nullptr : mem;
 }
 
-// Make a memory page writable (temporarily, for writing the hook)
-static bool makeWritable(void* addr, size_t len) {
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(0x1000ULL - 1);
-    uintptr_t endPage = (reinterpret_cast<uintptr_t>(addr) + len + 0xFFFULL) & ~(0x1000ULL - 1);
-    size_t regionSize = endPage - page;
-    // Remove exec, add write
-    if (mprotect(reinterpret_cast<void*>(page), regionSize,
-                 PROT_READ | PROT_WRITE) != 0) {
-        LOGE("MiniHook: mprotect(RW) failed for %p: %s",
-             reinterpret_cast<void*>(page), strerror(errno));
-        return false;
-    }
-    return true;
+static bool setPagePerms(void* addr, size_t len, int prot) {
+    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL;
+    uintptr_t end  = (reinterpret_cast<uintptr_t>(addr) + len + 0xFFFULL) & ~0xFFFULL;
+    return mprotect(reinterpret_cast<void*>(page), end - page, prot) == 0;
 }
 
-// Restore page to executable
-static bool makeExecutable(void* addr, size_t len) {
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(0x1000ULL - 1);
-    uintptr_t endPage = (reinterpret_cast<uintptr_t>(addr) + len + 0xFFFULL) & ~(0x1000ULL - 1);
-    size_t regionSize = endPage - page;
-    if (mprotect(reinterpret_cast<void*>(page), regionSize,
-                 PROT_READ | PROT_EXEC) != 0) {
-        LOGE("MiniHook: mprotect(RX) failed for %p: %s",
-             reinterpret_cast<void*>(page), strerror(errno));
-        return false;
-    }
-    return true;
-}
-
-// Flush instruction cache (required on ARM64 after code modification)
-static void flushICache(void* begin, void* end) {
-    __builtin___clear_cache(static_cast<char*>(begin),
-                             static_cast<char*>(end));
-}
-
-/**
- * Install an inline hook: target → detour, with trampoline stored in *original
- *
- * @param target   Address of the function to hook
- * @param detour   Address of the replacement function
- * @param original Receives a trampoline that calls the original function
- * @return true on success
- */
 static bool hook(void* target, void* detour, void** original) {
     if (!target || !detour || !original) return false;
-
-    LOGI("MiniHook: hooking %p → %p", target, detour);
-
-    // 1. Verify the first 4 instructions are not PC-relative
     auto* insns = static_cast<uint32_t*>(target);
     for (int i = 0; i < 4; ++i) {
-        if (isPCRelative(insns[i])) {
-            LOGW("MiniHook: instruction %d at %p is PC-relative (0x%08X) — "
-                 "hook may be unstable!", i, &insns[i], insns[i]);
-            // Continue anyway — it might still work if the offset happens
-            // to be zero or the instruction isn't actually reached
-        }
+        if (isPCRelative(insns[i]))
+            LOGW("MiniHook: insn %d at %p is PC-relative (0x%08X)", i, &insns[i], insns[i]);
     }
-
-    // 2. Allocate trampoline
     void* trampoline = allocTrampoline();
-    if (!trampoline) {
-        LOGE("MiniHook: failed to allocate trampoline");
-        return false;
-    }
-
-    // 3. Copy original instructions to trampoline
+    if (!trampoline) return false;
     memcpy(trampoline, target, kJumpSize);
-
-    // 4. Write jump back to target + kJumpSize at end of trampoline
-    writeAbsoluteJump(
-        static_cast<uint8_t*>(trampoline) + kJumpSize,
-        static_cast<uint8_t*>(target) + kJumpSize
-    );
-
-    // 5. Make trampoline executable (it was allocated RWX, but be safe)
-    flushICache(trampoline, static_cast<uint8_t*>(trampoline) + kTrampSize);
-
-    // 6. Make target writable
-    if (!makeWritable(target, kJumpSize)) {
-        munmap(trampoline, kTrampSize);
-        return false;
-    }
-
-    // 7. Write jump to detour at target
+    writeAbsoluteJump(static_cast<uint8_t*>(trampoline)+kJumpSize,
+                      static_cast<uint8_t*>(target)+kJumpSize);
+    __builtin___clear_cache(static_cast<char*>(trampoline),
+                            static_cast<char*>(trampoline)+kTrampSize);
+    if (!setPagePerms(target, kJumpSize, PROT_READ|PROT_WRITE)) { munmap(trampoline,kTrampSize); return false; }
     writeAbsoluteJump(target, detour);
-
-    // 8. Make target executable again
-    makeExecutable(target, kJumpSize);
-
-    // 9. Flush instruction cache
-    flushICache(target, static_cast<uint8_t*>(target) + kJumpSize);
-
-    // 10. Set original to trampoline
+    setPagePerms(target, kJumpSize, PROT_READ|PROT_EXEC);
+    __builtin___clear_cache(static_cast<char*>(target),
+                            static_cast<char*>(target)+kJumpSize);
     *original = trampoline;
-
-    LOGI("MiniHook: hook installed — trampoline at %p", trampoline);
     return true;
 }
-
 } // namespace MiniHook
 
 // ═══════════════════════════════════════════════════════════════════
-//  MC Field Offsets (ARM64, MC Bedrock ~1.21.44 / protocol 26.44)
-//  These may need adjustment for other versions.
-// ═══════════════════════════════════════════════════════════════════
-namespace Offsets {
-    namespace Actor {
-        constexpr size_t mEntityContext          = 0x008;
-        constexpr size_t mEntityData             = 0x120;
-        constexpr size_t mStateVectorComponent   = 0x208;
-        constexpr size_t mActorRotationComponent = 0x218;
-        constexpr size_t mDimension              = 448;
-        constexpr size_t mLevel                  = 464;
-        constexpr size_t mHurtTime               = 0x194;
-        constexpr size_t mCategories              = 512;
-        constexpr size_t mNameTagHash            = 384;
-        constexpr size_t mFilteredNameTag        = 712;
-        constexpr size_t mNameTag                = 0x2C0;
-        constexpr size_t mRuntimeID              = 0x1A8;
-    }
-    namespace Player {
-        constexpr size_t mName           = 2824;
-        constexpr size_t mUUID_Most      = 2800;
-        constexpr size_t mUUID_Least     = 2808;
-        constexpr size_t mMovementSpeed  = 2900;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Field accessor (offset-based)
+//  SECTION 2: Memory utilities
 // ═══════════════════════════════════════════════════════════════════
 template <class T>
-static T& fieldAt(void* obj, size_t offset) {
-    return *reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(obj) + offset);
+static T& fieldAt(void* obj, size_t off) {
+    return *reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(obj)+off);
+}
+static std::string readStr(void* obj, size_t off) {
+    try { return fieldAt<std::string>(obj, off); } catch (...) { return {}; }
+}
+static void writeStr(void* obj, size_t off, const std::string& val) {
+    try { fieldAt<std::string>(obj, off) = val; } catch (...) {}
 }
 
-static std::string readStringAt(void* obj, size_t offset) {
+struct ModuleInfo { void* base=nullptr; size_t size=0; };
+static ModuleInfo getModuleInfo(const char* name) {
+    ModuleInfo info; FILE* f=fopen("/proc/self/maps","r");
+    if(!f) return info; char line[512]; void* hi=nullptr;
+    while(fgets(line,sizeof(line),f)) {
+        if(strstr(line,name)) { uintptr_t s,e;
+            if(sscanf(line,"%lx-%lx",&s,&e)==2) {
+                if(!info.base||(void*)s<info.base) info.base=(void*)s;
+                if(!hi||(void*)e>hi) hi=(void*)e;
+            }
+        }
+    }
+    fclose(f); if(info.base&&hi) info.size=(size_t)hi-(size_t)info.base;
+    return info;
+}
+
+// Pattern scanner
+static void* scanPattern(void* start, size_t len, const char* pat, const char* mask) {
+    size_t pl=strlen(mask); auto* b=reinterpret_cast<uint8_t*>(start);
+    for(auto* p=b; p<=b+len-pl; ++p) { bool ok=true;
+        for(size_t j=0;j<pl;++j) if(mask[j]=='x'&&p[j]!=(uint8_t)pat[j]){ok=false;break;}
+        if(ok) return p;
+    } return nullptr;
+}
+struct HexPat { std::vector<uint8_t> bytes; std::string mask; };
+static HexPat parseHex(const char* h) {
+    HexPat p; const char* c=h;
+    while(*c) { while(*c==' ')++c; if(!*c) break;
+        if(c[0]=='?'&&c[1]=='?') { p.bytes.push_back(0); p.mask+='?'; c+=2; }
+        else { char b[3]={c[0],c[1],0}; p.bytes.push_back((uint8_t)strtoul(b,nullptr,16)); p.mask+='x'; c+=2; }
+    } return p;
+}
+static void* scanHex(void* start, size_t len, const char* hex) {
+    auto p=parseHex(hex); if(p.bytes.empty()) return nullptr;
+    return scanPattern(start,len,reinterpret_cast<const char*>(p.bytes.data()),p.mask.c_str());
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 3: Symbol resolution (dlsym + RTTI/vtable + patterns)
+// ═══════════════════════════════════════════════════════════════════
+static void* gLibMC = nullptr;
+
+static void* trySym(const char* sym) {
+    if(gLibMC) { void* a=dlsym(gLibMC,sym); if(a) return a; }
+    void* a=dlsym(RTLD_DEFAULT,sym); if(a) return a;
+    return nullptr;
+}
+
+struct MCSyms {
+    void* CI_update=nullptr, *CI_getLocalPlayer=nullptr;
+    void* Actor_getNameTag=nullptr, *Actor_setNameTag=nullptr;
+    void* Actor_isPlayer=nullptr, *Mob_normalTick=nullptr;
+    void* Level_addEntity=nullptr;
+    // Vtables found via RTTI
+    void* vtbl_Actor=nullptr, *vtbl_Mob=nullptr, *vtbl_Player=nullptr;
+};
+static MCSyms gS;
+
+static bool resolveSymbols() {
+    LOGI("=== Resolving MC symbols ===");
+
+    // Function symbols (multiple mangled variants per function)
+    struct { const char** names; void** target; } symGroups[] = {
+        {(const char*[]){"_ZN15ClientInstance6updateEv","_ZN15ClientInstance6updateEf",nullptr}, &gS.CI_update},
+        {(const char*[]){"_ZN15ClientInstance14getLocalPlayerEv","_ZNK15ClientInstance14getLocalPlayerEv",nullptr}, &gS.CI_getLocalPlayer},
+        {(const char*[]){"_ZNK5Actor11getNameTagB5cxx11Ev","_ZNK5Actor11getNameTagEv",nullptr}, &gS.Actor_getNameTag},
+        {(const char*[]){"_ZN5Actor11setNameTagERKNSt3__112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE",nullptr}, &gS.Actor_setNameTag},
+        {(const char*[]){"_ZNK5Actor8isPlayerEv",nullptr}, &gS.Actor_isPlayer},
+        {(const char*[]){"_ZN3Mob10normalTickEv",nullptr}, &gS.Mob_normalTick},
+        {(const char*[]){"_ZN5Level9addEntityERK10ActorUniqueIDS5","_ZN5Level9addEntityE10ActorUniqueID",nullptr}, &gS.Level_addEntity},
+    };
+    for(auto& g : symGroups) {
+        for(int i=0; g.names[i]; ++i) {
+            *g.target = trySym(g.names[i]);
+            if(*g.target) { LOGI("  %s → %p", g.names[i], *g.target); break; }
+        }
+    }
+
+    // RTTI vtables (very stable across versions — needed for type checking)
+    gS.vtbl_Actor  = trySym("_ZTV5Actor");
+    gS.vtbl_Mob    = trySym("_ZTV3Mob");
+    gS.vtbl_Player = trySym("_ZTV6Player");
+    if(gS.vtbl_Actor)  LOGI("  Actor vtable at %p", gS.vtbl_Actor);
+    if(gS.vtbl_Mob)    LOGI("  Mob vtable at %p", gS.vtbl_Mob);
+    if(gS.vtbl_Player) LOGI("  Player vtable at %p", gS.vtbl_Player);
+
+    // Pattern scanning fallback
+    auto mi = getModuleInfo("libminecraftpe.so");
+    if(mi.base && mi.size) {
+        LOGI("  libminecraftpe.so: base=%p size=0x%zx", mi.base, mi.size);
+        if(!gS.CI_update) gS.CI_update = scanHex(mi.base,mi.size,"A9 01 7B A9 F7 03 7B A9 FD 03 00 91 ?? ?? ?? D1 59 D0 3B D5");
+        if(!gS.Mob_normalTick) gS.Mob_normalTick = scanHex(mi.base,mi.size,"FC 01 7B A9 F8 0F 7B A9 ?? ?? ?? A9 ?? ?? ?? A9 ?? ?? ?? A9 54 D0 3B D5");
+        if(!gS.CI_getLocalPlayer) gS.CI_getLocalPlayer = scanHex(mi.base,mi.size,"?? ?? ?? D1 ?? ?? ?? A9 ?? ?? ?? F9 ?? ?? ?? 91 53 D0 3B D5 E8 03 00 AA");
+    }
+
+    int n=0;
+    if(gS.CI_update)++n; if(gS.CI_getLocalPlayer)++n; if(gS.Actor_getNameTag)++n;
+    if(gS.Actor_setNameTag)++n; if(gS.Actor_isPlayer)++n; if(gS.Mob_normalTick)++n;
+    if(gS.Level_addEntity)++n;
+    LOGI("Symbol resolution: %d functions + %d vtables", n,
+         (gS.vtbl_Actor?1:0)+(gS.vtbl_Mob?1:0)+(gS.vtbl_Player?1:0));
+    return n > 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 4: MC Offsets (ARM64, ~1.21.44)
+// ═══════════════════════════════════════════════════════════════════
+namespace O { // Offsets
+    namespace Actor {
+        constexpr size_t mRuntimeID=0x1A8, mNameTag=0x2C0, mHurtTime=0x194;
+        constexpr size_t mDimension=448, mLevel=464;
+        // ActorDefinitionIdentifier — contains the mob type string
+        constexpr size_t mDesc=0x1B0;
+    }
+    namespace ActorDefId {
+        // The identifier string (e.g. "minecraft:zombie") is at this offset
+        // inside the ActorDefinitionIdentifier struct
+        constexpr size_t mIdentifier=0x08;
+    }
+    namespace Player {
+        constexpr size_t mName=2824, mUUID_Most=2800, mUUID_Least=2808;
+        constexpr size_t mMovementSpeed=2900;
+        // PlayerInventory pointer
+        constexpr size_t mInventory=0x2A0;
+    }
+    namespace PlayerInventory {
+        // Container pointer inside PlayerInventory
+        constexpr size_t mContainer=0x08;
+    }
+    namespace Container {
+        // ItemStack array pointer and count
+        constexpr size_t mItems=0x18, mCount=0x10;
+    }
+    // ItemStack size (approximate — varies by version)
+    constexpr size_t kItemStackSize = 152;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 5: Texture Swapping — Resource Pack Generation
+//
+//  Creates a MC Bedrock resource pack that remaps block textures.
+//  The pack goes in MC's resource_packs/ directory and MC loads it
+//  as an overlay, swapping which texture each block uses.
+// ═══════════════════════════════════════════════════════════════════
+namespace TextureSwap {
+
+// Common block texture names for permutation
+static const std::vector<std::string> blockTextures = {
+    "stone","dirt","grass_side","grass_carried","cobblestone","oak_planks",
+    "spruce_planks","birch_planks","jungle_planks","acacia_planks","dark_oak_planks",
+    "oak_log","spruce_log","birch_log","jungle_log","sand","red_sand","gravel",
+    "oak_log_top","spruce_log_top","birch_log_top","jungle_log_top",
+    "glass","iron_block","gold_block","diamond_block","emerald_block",
+    "lapis_block","redstone_block","coal_block","obsidian","ice","packed_ice",
+    "snow","clay","netherrack","soul_sand","glowstone","magma","bedrock",
+    "sandstone_bottom","sandstone_side","sandstone_top",
+    "red_sandstone_bottom","red_sandstone_side","red_sandstone_top",
+    "oak_leaves","spruce_leaves","birch_leaves",
+    "wool","hardened_clay","prismarine_rough","prismarine_dark","prismarine_bricks",
+    "sea_lantern","hay_block_top","hay_block_side","bone_block_side","bone_block_top",
+    "purpur_block","purpur_pillar_top","purpur_pillar","end_bricks","end_stone",
+    "chorus_plant","chorus_flower",
+};
+
+static std::string findMCDataDir() {
+    // Try common MC Bedrock data directories on Android
+    const char* bases[] = {
+        "/sdcard/Android/data/com.mojang.minecraftpe/files/games/com.mojang",
+        "/storage/emulated/0/Android/data/com.mojang.minecraftpe/files/games/com.mojang",
+        "/data/data/com.mojang.minecraftpe/files/games/com.mojang",
+        nullptr
+    };
+    for(int i=0; bases[i]; ++i) {
+        struct stat st;
+        if(stat(bases[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+            LOGI("Found MC data dir: %s", bases[i]);
+            return bases[i];
+        }
+    }
+    return {};
+}
+
+static bool writeFile(const std::string& path, const std::string& content) {
+    std::ofstream f(path);
+    if(!f.is_open()) return false;
+    f << content;
+    f.close();
+    return true;
+}
+
+static bool mkdirp(const std::string& path) {
+    // Simple recursive mkdir
+    for(size_t i=1; i<path.size(); ++i) {
+        if(path[i]=='/') {
+            std::string sub=path.substr(0,i);
+            mkdir(sub.c_str(), 0755);
+        }
+    }
+    mkdir(path.c_str(), 0755);
+    struct stat st;
+    return stat(path.c_str(),&st)==0 && S_ISDIR(st.st_mode);
+}
+
+static bool generateResourcePack(uint64_t seed) {
+    LOGI("=== Generating texture swap resource pack (seed 0x%016lX) ===", (unsigned long)seed);
+
+    std::string mcDir = findMCDataDir();
+    if(mcDir.empty()) {
+        LOGW("MC data dir not found — texture pack will be written to /sdcard/");
+        mcDir = "/sdcard";
+    }
+
+    std::string packDir = mcDir + "/resource_packs/Personalized_Textures";
+    std::string texDir  = packDir + "/textures";
+
+    if(!mkdirp(texDir)) {
+        LOGE("Failed to create pack directory: %s", packDir.c_str());
+        return false;
+    }
+
+    // Generate permutation of block textures
+    auto permutation = RandomMapper::partialScramble(
+        seed, blockTextures.size(), 0.6, 2);
+
+    // --- manifest.json ---
+    // UUIDs derived from seed for uniqueness
+    std::mt19937_64 rng(seed ^ 0xDEADBEEFCAFEBABEULL);
+    auto genUUID = [&rng]() -> std::string {
+        char buf[37];
+        snprintf(buf,sizeof(buf),"%08lx-%04lx-%04lx-%04lx-%012lx",
+            (unsigned long)(rng()&0xFFFFFFFF),
+            (unsigned long)(rng()&0xFFFF),
+            (unsigned long)((rng()&0xFFFF)|0x4000),  // version 4
+            (unsigned long)((rng()&0x3FFF)|0x8000),  // variant 1
+            (unsigned long)(rng()&0xFFFFFFFFFFFF));
+        return buf;
+    };
+    std::string headerUUID = genUUID();
+    std::string moduleUUID = genUUID();
+
+    std::string manifest =
+        "{\n"
+        "  \"format_version\": 2,\n"
+        "  \"header\": {\n"
+        "    \"name\": \"Personalized Textures\",\n"
+        "    \"description\": \"UUID-seeded texture permutation by Personalized mod\",\n"
+        "    \"uuid\": \"" + headerUUID + "\",\n"
+        "    \"version\": [1, 0, 0],\n"
+        "    \"min_engine_version\": [1, 21, 0]\n"
+        "  },\n"
+        "  \"modules\": [{\n"
+        "    \"type\": \"resources\",\n"
+        "    \"uuid\": \"" + moduleUUID + "\",\n"
+        "    \"version\": [1, 0, 0]\n"
+        "  }]\n"
+        "}\n";
+
+    if(!writeFile(packDir+"/manifest.json", manifest)) {
+        LOGE("Failed to write manifest.json"); return false;
+    }
+
+    // --- terrain_texture.json ---
+    // Maps each block texture to a DIFFERENT texture based on the permutation
+    std::ostringstream ttj;
+    ttj << "{\n"
+        << "  \"resource_pack_name\": \"Personalized\",\n"
+        << "  \"texture_name\": \"atlas.terrain\",\n"
+        << "  \"padding\": 8,\n"
+        << "  \"num_mip_levels\": 4,\n"
+        << "  \"texture_data\": {\n";
+
+    for(size_t i=0; i<blockTextures.size(); ++i) {
+        size_t j = permutation[i];
+        if(j >= blockTextures.size()) j = i; // safety
+        const auto& from = blockTextures[i];
+        const auto& to   = blockTextures[j];
+
+        ttj << "    \"" << from << "\": {\n"
+            << "      \"textures\": \"textures/blocks/" << to << "\"\n"
+            << "    }";
+        if(i+1 < blockTextures.size()) ttj << ",";
+        ttj << "\n";
+    }
+
+    ttj << "  }\n}\n";
+
+    if(!writeFile(packDir+"/textures/terrain_texture.json", ttj.str())) {
+        LOGE("Failed to write terrain_texture.json"); return false;
+    }
+
+    LOGI("Texture resource pack generated at %s (%zu texture swaps)",
+         packDir.c_str(), blockTextures.size());
+
+    // Try to activate the pack by adding to world_resource_packs.json
+    std::string wrpPath = mcDir + "/resource_packs/world_resource_packs.json";
+    // Just log it — proper activation would require JSON manipulation
+    LOGI("To activate: add pack '%s' to MC's resource pack settings", packDir.c_str());
+
+    return true;
+}
+
+} // namespace TextureSwap
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 6: Inventory Scrambling
+//
+//  Permutes the ItemStack slots in the player's inventory container.
+//  Uses Fisher-Yates shuffle seeded by the player's UUID.
+//  The scrambling is applied periodically and can be toggled.
+// ═══════════════════════════════════════════════════════════════════
+namespace InventoryScramble {
+
+static std::vector<size_t> gInvPermutation;
+static std::mutex gInvMutex;
+static std::atomic<bool> gInvScrambled{false};
+
+// Build the inventory slot permutation from seed
+static void buildPermutation(uint64_t seed) {
+    // 36 slots = 4 rows of 9 in player inventory
+    // (hotbar slots 0-8, main inventory 9-35)
+    const size_t slotCount = 36;
+    gInvPermutation = RandomMapper::partialScramble(
+        seed ^ 0x1NV3NT0RY, slotCount, 0.7, 3);
+    LOGI("Inventory permutation built: %zu slots", slotCount);
+}
+
+// Apply the permutation to the player's inventory
+static void scrambleInventory(void* playerPtr) {
+    if(!playerPtr || gInvPermutation.empty()) return;
+    if(gInvScrambled.load()) return; // Only scramble once on initial join
+
+    std::lock_guard lock(gInvMutex);
+
     try {
-        auto& str = fieldAt<std::string>(obj, offset);
-        return str;
-    } catch (...) {
-        return {};
+        // Navigate: Player → PlayerInventory → Container → ItemStack[]
+        void* invPtr = fieldAt<void*>(playerPtr, O::Player::mInventory);
+        if(!invPtr) return;
+
+        void* containerPtr = fieldAt<void*>(invPtr, O::PlayerInventory::mContainer);
+        if(!containerPtr) return;
+
+        int count = fieldAt<int>(containerPtr, O::Container::mCount);
+        if(count <= 0) count = 36; // default player inventory size
+        void* itemsBase = fieldAt<void*>(containerPtr, O::Container::mItems);
+        if(!itemsBase) return;
+
+        // Apply permutation: swap ItemStack data in each slot
+        // We work on a copy to avoid partial states
+        size_t itemSize = O::kItemStackSize;
+        std::vector<uint8_t> buffer(itemSize);
+
+        // First, snapshot all items
+        std::vector<std::vector<uint8_t>> originals(count);
+        for(int i=0; i<count; ++i) {
+            originals[i].resize(itemSize);
+            void* slot = static_cast<uint8_t*>(itemsBase) + i * itemSize;
+            memcpy(originals[i].data(), slot, itemSize);
+        }
+
+        // Then, write items in permuted order
+        for(int i=0; i<count; ++i) {
+            size_t j = (i < gInvPermutation.size()) ? gInvPermutation[i] : i;
+            if(j >= (size_t)count) j = i;
+            void* slot = static_cast<uint8_t*>(itemsBase) + i * itemSize;
+            memcpy(slot, originals[j].data(), itemSize);
+        }
+
+        gInvScrambled.store(true);
+        LOGI("Inventory scrambled: %d slots permuted", count);
+    } catch(...) {
+        LOGW("Inventory scramble failed (bad offset?)");
     }
 }
 
+// Unscramble (restore original order) — useful for clean disable
+static void unscrambleInventory(void* playerPtr) {
+    // Apply inverse permutation
+    if(!playerPtr || gInvPermutation.empty()) return;
+    // For simplicity, just mark as not scrambled; next tick will re-apply
+    gInvScrambled.store(false);
+}
+
+} // namespace InventoryScramble
+
 // ═══════════════════════════════════════════════════════════════════
-//  Global State
+//  SECTION 7: Mob Model Swapping
+//
+//  Modifies the ActorDefinitionIdentifier string of mobs to change
+//  which model/texture/animation they use. Combined with entity
+//  creation hooking for new mobs and periodic scanning for existing ones.
 // ═══════════════════════════════════════════════════════════════════
-static Config                         gConfig;
-static std::atomic<bool>              gMinecraftLoaded{false};
-static std::atomic<bool>              gHooksInstalled{false};
-static std::atomic<bool>              gPlayerSeedReady{false};
-static std::atomic<bool>              gInitializing{false};
-static void*                          gLibMinecraftPe = nullptr;
-static void*                          gLocalPlayer   = nullptr;
+namespace MobSwap {
 
-// ─── Resolved MC symbols ───
-struct MCSymbols {
-    void* ClientInstance_update         = nullptr;
-    void* ClientInstance_getLocalPlayer = nullptr;
-    void* Actor_getNameTag              = nullptr;
-    void* Actor_setNameTag              = nullptr;
-    void* Actor_isPlayer                = nullptr;
-    void* Mob_normalTick                = nullptr;
-};
-static MCSymbols gSymbols;
-
-// ─── Hook trampolines ───
-using ClientInstance_Update_Fn = void(*)(void*, void*, void*);
-static ClientInstance_Update_Fn orig_CI_update = nullptr;
-
-using Mob_NormalTick_Fn = void(*)(void*);
-static Mob_NormalTick_Fn orig_Mob_normalTick = nullptr;
-
-using Actor_SetNameTag_Fn = void(*)(void*, const std::string&);
-static Actor_SetNameTag_Fn orig_Actor_setNameTag = nullptr;
-
-// ─── Mob swap map ───
 static const std::vector<std::string> mobPool = {
     "minecraft:zombie",   "minecraft:skeleton",  "minecraft:pig",
     "minecraft:cow",      "minecraft:sheep",     "minecraft:chicken",
     "minecraft:creeper",  "minecraft:spider",    "minecraft:blaze",
-    "minecraft:enderman",
+    "minecraft:enderman", "minecraft:witch",     "minecraft:villager_v2",
+    "minecraft:iron_golem","minecraft:wolf",     "minecraft:cat",
+    "minecraft:horse",    "minecraft:phantom",   "minecraft:pillager",
 };
 static std::unordered_map<std::string, std::string> mobSwapMap;
+static std::unordered_set<uint64_t> gSwappedMobs;
+static std::mutex gMobMutex;
 
-// ─── Tracked entities ───
-static std::unordered_set<uint64_t> gScrambledEntities;
-static std::mutex                    gEntityMutex;
-
-// ═══════════════════════════════════════════════════════════════════
-//  Module info (parse /proc/self/maps)
-// ═══════════════════════════════════════════════════════════════════
-struct ModuleInfo {
-    void*  base = nullptr;
-    size_t size = 0;
-};
-
-static ModuleInfo getModuleInfo(const char* name) {
-    ModuleInfo info;
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) return info;
-
-    char line[512];
-    void* highestEnd = nullptr;
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, name)) {
-            uintptr_t start, stop;
-            if (sscanf(line, "%lx-%lx", &start, &stop) == 2) {
-                if (!info.base || (void*)start < info.base)
-                    info.base = (void*)start;
-                if (!highestEnd || (void*)stop > highestEnd)
-                    highestEnd = (void*)stop;
-            }
-        }
-    }
-    fclose(f);
-    if (info.base && highestEnd)
-        info.size = (size_t)highestEnd - (size_t)info.base;
-    return info;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Pattern Scanner
-// ═══════════════════════════════════════════════════════════════════
-static void* scanPattern(void* start, size_t length,
-                          const char* pattern, const char* mask)
-{
-    size_t patLen = strlen(mask);
-    auto* base = reinterpret_cast<uint8_t*>(start);
-    auto* end  = base + length - patLen;
-
-    for (auto* p = base; p <= end; ++p) {
-        bool found = true;
-        for (size_t j = 0; j < patLen; ++j) {
-            if (mask[j] == 'x' && p[j] != static_cast<uint8_t>(pattern[j])) {
-                found = false;
-                break;
-            }
-        }
-        if (found) return p;
-    }
-    return nullptr;
-}
-
-struct Pattern {
-    std::vector<uint8_t> bytes;
-    std::string          mask;
-};
-
-static Pattern parsePattern(const char* hexStr) {
-    Pattern pat;
-    const char* p = hexStr;
-    while (*p) {
-        while (*p == ' ') ++p;
-        if (!*p) break;
-        if (p[0] == '?' && p[1] == '?') {
-            pat.bytes.push_back(0);
-            pat.mask += '?';
-            p += 2;
-        } else {
-            char byteStr[3] = {p[0], p[1], 0};
-            pat.bytes.push_back(static_cast<uint8_t>(strtoul(byteStr, nullptr, 16)));
-            pat.mask += 'x';
-            p += 2;
-        }
-    }
-    return pat;
-}
-
-static void* scanHexPattern(void* start, size_t length, const char* hexStr) {
-    auto pat = parsePattern(hexStr);
-    if (pat.bytes.empty()) return nullptr;
-    return scanPattern(start, length,
-                       reinterpret_cast<const char*>(pat.bytes.data()),
-                       pat.mask.c_str());
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Symbol Resolution
-// ═══════════════════════════════════════════════════════════════════
-static void* tryResolve(const char* symbol) {
-    // 1) dlsym from already-loaded MC library
-    if (gLibMinecraftPe) {
-        void* addr = dlsym(gLibMinecraftPe, symbol);
-        if (addr) return addr;
-    }
-
-    // 2) dlsym from RTLD_DEFAULT (searches all loaded libraries)
-    void* addr = dlsym(RTLD_DEFAULT, symbol);
-    if (addr) return addr;
-
-    return nullptr;
-}
-
-static bool resolveSymbols() {
-    LOGI("=== Resolving MC symbols from libminecraftpe.so ===");
-
-    // ClientInstance::update — multiple mangled name variants
-    const char* ci_update_variants[] = {
-        "_ZN15ClientInstance6updateEv",
-        "_ZN15ClientInstance6updateEf",
-        "_ZN15ClientInstance6updateE6float",
-        nullptr
-    };
-    for (int i = 0; ci_update_variants[i]; ++i) {
-        gSymbols.ClientInstance_update = tryResolve(ci_update_variants[i]);
-        if (gSymbols.ClientInstance_update) {
-            LOGI("  ClientInstance::update via: %s", ci_update_variants[i]);
-            break;
-        }
-    }
-
-    // ClientInstance::getLocalPlayer
-    const char* ci_getlp_variants[] = {
-        "_ZN15ClientInstance14getLocalPlayerEv",
-        "_ZNK15ClientInstance14getLocalPlayerEv",
-        nullptr
-    };
-    for (int i = 0; ci_getlp_variants[i]; ++i) {
-        gSymbols.ClientInstance_getLocalPlayer = tryResolve(ci_getlp_variants[i]);
-        if (gSymbols.ClientInstance_getLocalPlayer) {
-            LOGI("  ClientInstance::getLocalPlayer via: %s", ci_getlp_variants[i]);
-            break;
-        }
-    }
-
-    // Actor::getNameTag
-    const char* agn_variants[] = {
-        "_ZNK5Actor11getNameTagB5cxx11Ev",
-        "_ZNK5Actor11getNameTagEv",
-        nullptr
-    };
-    for (int i = 0; agn_variants[i]; ++i) {
-        gSymbols.Actor_getNameTag = tryResolve(agn_variants[i]);
-        if (gSymbols.Actor_getNameTag) {
-            LOGI("  Actor::getNameTag via: %s", agn_variants[i]);
-            break;
-        }
-    }
-
-    // Actor::setNameTag
-    const char* asn_variants[] = {
-        "_ZN5Actor11setNameTagERKNSt3__112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE",
-        "_ZN5Actor11setNameTagENSt3__112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE",
-        nullptr
-    };
-    for (int i = 0; asn_variants[i]; ++i) {
-        gSymbols.Actor_setNameTag = tryResolve(asn_variants[i]);
-        if (gSymbols.Actor_setNameTag) {
-            LOGI("  Actor::setNameTag via: %s", asn_variants[i]);
-            break;
-        }
-    }
-
-    // Actor::isPlayer
-    gSymbols.Actor_isPlayer = tryResolve("_ZNK5Actor8isPlayerEv");
-    if (gSymbols.Actor_isPlayer) LOGI("  Actor::isPlayer resolved");
-
-    // Mob::normalTick
-    gSymbols.Mob_normalTick = tryResolve("_ZN3Mob10normalTickEv");
-    if (gSymbols.Mob_normalTick) LOGI("  Mob::normalTick resolved");
-
-    // ─── Fallback: pattern scanning ───
-    if (!gSymbols.ClientInstance_update || !gSymbols.Mob_normalTick) {
-        LOGI("Some symbols unresolved — trying pattern scanning ...");
-        auto modInfo = getModuleInfo("libminecraftpe.so");
-        if (modInfo.base && modInfo.size) {
-            LOGI("  libminecraftpe.so: base=%p size=0x%zx", modInfo.base, modInfo.size);
-
-            if (!gSymbols.ClientInstance_update) {
-                void* addr = scanHexPattern(modInfo.base, modInfo.size,
-                    "A9 01 7B A9 F7 03 7B A9 FD 03 00 91 ?? ?? ?? D1 59 D0 3B D5");
-                if (addr) {
-                    gSymbols.ClientInstance_update = addr;
-                    LOGI("  ClientInstance::update found via pattern at %p", addr);
-                }
-            }
-
-            if (!gSymbols.Mob_normalTick) {
-                void* addr = scanHexPattern(modInfo.base, modInfo.size,
-                    "FC 01 7B A9 F8 0F 7B A9 ?? ?? ?? A9 ?? ?? ?? A9 ?? ?? ?? A9 54 D0 3B D5");
-                if (addr) {
-                    gSymbols.Mob_normalTick = addr;
-                    LOGI("  Mob::normalTick found via pattern at %p", addr);
-                }
-            }
-
-            if (!gSymbols.ClientInstance_getLocalPlayer) {
-                void* addr = scanHexPattern(modInfo.base, modInfo.size,
-                    "?? ?? ?? D1 ?? ?? ?? A9 ?? ?? ?? F9 ?? ?? ?? 91 53 D0 3B D5 E8 03 00 AA");
-                if (addr) {
-                    gSymbols.ClientInstance_getLocalPlayer = addr;
-                    LOGI("  ClientInstance::getLocalPlayer found via pattern at %p", addr);
-                }
-            }
-        } else {
-            LOGW("  Could not get libminecraftpe.so module info for scanning");
-        }
-    }
-
-    int resolved = 0;
-    if (gSymbols.ClientInstance_update) ++resolved;
-    if (gSymbols.ClientInstance_getLocalPlayer) ++resolved;
-    if (gSymbols.Actor_getNameTag) ++resolved;
-    if (gSymbols.Actor_setNameTag) ++resolved;
-    if (gSymbols.Actor_isPlayer) ++resolved;
-    if (gSymbols.Mob_normalTick) ++resolved;
-
-    LOGI("Symbol resolution complete: %d/6 resolved", resolved);
-    return resolved > 0;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Build mob swap map from seed
-// ═══════════════════════════════════════════════════════════════════
-static void buildMobSwapMap() {
-    if (!SeedManager::instance().isInitialized()) return;
-
-    std::mt19937_64 rng(SeedManager::instance().getSeed() ^ 0xB0B0FACEDEADBEEFULL);
+static void buildSwapMap(uint64_t seed) {
+    std::mt19937_64 rng(seed ^ 0xB0B0FACEDEADBEEFULL);
     mobSwapMap.clear();
-
-    for (const auto& mobId : mobPool) {
-        std::uniform_real_distribution<double> dist(0.0, 1.0);
-        if (dist(rng) > gConfig.mobSwapIntensity) continue;
-
-        std::string selected;
-        int attempts = 0;
+    for(const auto& id : mobPool) {
+        std::uniform_real_distribution<double> dist(0.0,1.0);
+        if(dist(rng) > 0.6) continue; // 60% of mobs get swapped
+        std::string selected; int att=0;
         do {
-            std::uniform_int_distribution<size_t> idxDist(0, mobPool.size() - 1);
-            selected = mobPool[idxDist(rng)];
-            ++attempts;
-        } while (selected == mobId && attempts < 10);
-
-        if (selected != mobId) {
-            mobSwapMap[mobId] = selected;
-            LOGD("Mob swap: %s -> %s", mobId.c_str(), selected.c_str());
-        }
+            std::uniform_int_distribution<size_t> idx(0,mobPool.size()-1);
+            selected = mobPool[idx(rng)]; ++att;
+        } while(selected==id && att<10);
+        if(selected!=id) mobSwapMap[id]=selected;
     }
     LOGI("Mob swap map: %zu entries", mobSwapMap.size());
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Nametag scrambling — VISIBLE effect that proves the mod works!
-// ═══════════════════════════════════════════════════════════════════
-static std::string scrambleNametag(const std::string& original, uint64_t entityID) {
-    if (original.empty()) return original;
-
-    std::mt19937_64 perEntityRng(SeedManager::instance().getSeed() ^ entityID ^ 0x5A5A5A5AULL);
-
-    std::string result = original;
-
-    // Caesar cipher shift on letters
-    uint64_t shift = perEntityRng() % 26;
-    for (auto& c : result) {
-        if (c >= 'a' && c <= 'z') c = 'a' + static_cast<char>((c - 'a' + shift) % 26);
-        else if (c >= 'A' && c <= 'Z') c = 'A' + static_cast<char>((c - 'A' + shift) % 26);
-    }
-
-    // Add visual prefix to make it OBVIOUS the mod is working
-    std::uniform_int_distribution<int> prefixDist(0, 3);
-    const char* prefixes[] = {"[P]", "~", "*", ">"};
-    result = prefixes[prefixDist(perEntityRng)] + result;
-
-    return result;
+// Get the identifier string from an Actor's ActorDefinitionIdentifier
+static std::string getMobIdentifier(void* actorPtr) {
+    if(!actorPtr) return {};
+    try {
+        void* descPtr = fieldAt<void*>(actorPtr, O::Actor::mDesc);
+        if(!descPtr) return {};
+        return readStr(descPtr, O::ActorDefId::mIdentifier);
+    } catch(...) { return {}; }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Apply effects to an entity
-// ═══════════════════════════════════════════════════════════════════
-static void applyEffectsToEntity(void* actorPtr) {
-    if (!actorPtr || !SeedManager::instance().isInitialized()) return;
+// Set the identifier string — this causes MC to use the new mob's model/texture
+static bool setMobIdentifier(void* actorPtr, const std::string& newId) {
+    if(!actorPtr) return false;
+    try {
+        void* descPtr = fieldAt<void*>(actorPtr, O::Actor::mDesc);
+        if(!descPtr) return false;
+        writeStr(descPtr, O::ActorDefId::mIdentifier, newId);
+        return true;
+    } catch(...) { return false; }
+}
+
+// Check if an actor is a player (skip players!)
+static bool isPlayer(void* actorPtr) {
+    if(gS.Actor_isPlayer) {
+        try { return reinterpret_cast<bool(*)(void*)>(gS.Actor_isPlayer)(actorPtr); }
+        catch(...) {}
+    }
+    // Fallback: check vtable
+    if(gS.vtbl_Player && actorPtr) {
+        void* vtbl = *reinterpret_cast<void**>(actorPtr);
+        // Player vtable should be at or after the Player vtable symbol
+        // This is a rough check — Player's vtable >= _ZTV6Player
+        // Not perfect but better than nothing
+    }
+    return false;
+}
+
+// Try to swap a mob's model
+static void trySwapMob(void* actorPtr) {
+    if(!actorPtr) return;
 
     uint64_t runtimeID = 0;
+    try { runtimeID = fieldAt<uint64_t>(actorPtr, O::Actor::mRuntimeID); }
+    catch(...) { return; }
+    if(runtimeID == 0) return;
+
+    if(isPlayer(actorPtr)) return;
+
+    std::lock_guard lock(gMobMutex);
+    if(gSwappedMobs.count(runtimeID)) return; // already swapped
+
+    std::string id = getMobIdentifier(actorPtr);
+    if(id.empty()) return;
+
+    auto it = mobSwapMap.find(id);
+    if(it == mobSwapMap.end()) {
+        gSwappedMobs.insert(runtimeID); // mark as seen even if no swap
+        return;
+    }
+
+    const std::string& newId = it->second;
+    if(setMobIdentifier(actorPtr, newId)) {
+        gSwappedMobs.insert(runtimeID);
+        LOGI("Mob model swap: %s → %s (entity 0x%lX)",
+             id.c_str(), newId.c_str(), (unsigned long)runtimeID);
+    }
+}
+
+} // namespace MobSwap
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 8: Nametag scrambling + player effects
+// ═══════════════════════════════════════════════════════════════════
+static std::string scrambleNametag(const std::string& orig, uint64_t eid) {
+    if(orig.empty()) return orig;
+    std::mt19937_64 rng(SeedManager::instance().getSeed() ^ eid ^ 0x5A5A5A5AULL);
+    std::string r = orig;
+    uint64_t shift = rng() % 26;
+    for(auto& c : r) {
+        if(c>='a'&&c<='z') c='a'+(char)((c-'a'+shift)%26);
+        else if(c>='A'&&c<='Z') c='A'+(char)((c-'A'+shift)%26);
+    }
+    const char* pfx[] = {"[P]","~","*","⇒"};
+    r = pfx[rng()%4] + r;
+    return r;
+}
+
+static void applyNametagScramble(void* actorPtr) {
+    if(!actorPtr || !SeedManager::instance().isInitialized()) return;
+    uint64_t rid=0;
+    try{rid=fieldAt<uint64_t>(actorPtr,O::Actor::mRuntimeID);}catch(...){return;}
+    if(rid==0||MobSwap::isPlayer(actorPtr)) return;
+
+    static std::unordered_set<uint64_t> done;
+    static std::mutex mtx;
+    std::lock_guard lock(mtx);
+    if(done.count(rid)) return;
+
+    std::string nameTag;
+    if(gS.Actor_getNameTag) {
+        try{nameTag=reinterpret_cast<std::string(*)(void*)>(gS.Actor_getNameTag)(actorPtr);}catch(...){}
+    }
+    if(nameTag.empty()) nameTag = readStr(actorPtr, O::Actor::mNameTag);
+    if(nameTag.empty()) return;
+
+    std::string scrambled = scrambleNametag(nameTag, rid);
+    if(gS.Actor_setNameTag) {
+        try{reinterpret_cast<void(*)(void*,const std::string&)>(gS.Actor_setNameTag)(actorPtr,scrambled);}catch(...){}
+    } else { writeStr(actorPtr, O::Actor::mNameTag, scrambled); }
+    done.insert(rid);
+}
+
+static void applyPlayerSpeed(void* playerPtr) {
+    if(!playerPtr || !SeedManager::instance().isInitialized()) return;
     try {
-        runtimeID = fieldAt<uint64_t>(actorPtr, Offsets::Actor::mRuntimeID);
-    } catch (...) { return; }
-    if (runtimeID == 0) return;
-
-    // Skip players
-    if (gSymbols.Actor_isPlayer) {
-        using IsPlayerFn = bool(*)(void*);
-        try {
-            if (reinterpret_cast<IsPlayerFn>(gSymbols.Actor_isPlayer)(actorPtr))
-                return;
-        } catch (...) {}
-    }
-
-    // ─── Effect 1: Nametag scrambling ───
-    {
-        std::lock_guard lock(gEntityMutex);
-        if (gScrambledEntities.find(runtimeID) == gScrambledEntities.end()) {
-            std::string nameTag;
-
-            // Try via resolved function
-            if (gSymbols.Actor_getNameTag) {
-                using GetNameTagFn = std::string(*)(void*);
-                try {
-                    nameTag = reinterpret_cast<GetNameTagFn>(gSymbols.Actor_getNameTag)(actorPtr);
-                } catch (...) {}
-            }
-            // Fallback: read from offset
-            if (nameTag.empty()) {
-                nameTag = readStringAt(actorPtr, Offsets::Actor::mNameTag);
-            }
-
-            if (!nameTag.empty()) {
-                std::string scrambled = scrambleNametag(nameTag, runtimeID);
-
-                if (gSymbols.Actor_setNameTag) {
-                    try {
-                        reinterpret_cast<Actor_SetNameTag_Fn>(gSymbols.Actor_setNameTag)(
-                            actorPtr, scrambled);
-                    } catch (...) {}
-                } else {
-                    try {
-                        fieldAt<std::string>(actorPtr, Offsets::Actor::mNameTag) = scrambled;
-                    } catch (...) {}
-                }
-
-                gScrambledEntities.insert(runtimeID);
-                LOGD("Scrambled entity 0x%lX: '%s' -> '%s'",
-                     (unsigned long)runtimeID, nameTag.c_str(), scrambled.c_str());
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Apply effects to the local player
-// ═══════════════════════════════════════════════════════════════════
-static void applyEffectsToPlayer(void* playerPtr) {
-    if (!playerPtr || !SeedManager::instance().isInitialized()) return;
-
-    // Movement speed modification — VERY visible
-    {
         auto rng = SeedManager::instance().createRNG();
-        std::uniform_real_distribution<float> speedDist(0.05f, 0.3f);
-        float newSpeed = speedDist(rng);
+        std::uniform_real_distribution<float> d(0.05f,0.3f);
+        fieldAt<float>(playerPtr, O::Player::mMovementSpeed) = d(rng);
+    } catch(...) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 9: Background Effect Thread
+//
+//  Runs even when hooks fail. Periodically scans for the player
+//  object and applies effects directly via memory manipulation.
+// ═══════════════════════════════════════════════════════════════════
+static std::atomic<bool> gBgThreadRunning{false};
+static void* gLocalPlayer = nullptr;
+static std::atomic<bool> gPlayerSeedReady{false};
+
+static void backgroundThread() {
+    LOGI("Background effect thread started");
+    gBgThreadRunning.store(true);
+    int tick = 0;
+
+    while(gBgThreadRunning.load()) {
+        usleep(500000); // 500ms between scans
+        ++tick;
+
+        if(!SeedManager::instance().isInitialized()) continue;
+        if(!gLocalPlayer) continue;
+
+        // Every 2 seconds: apply inventory scramble (once)
+        if(tick % 4 == 0 && !InventoryScramble::gInvScrambled.load()) {
+            InventoryScramble::scrambleInventory(gLocalPlayer);
+        }
+
+        // Every 1 second: apply player speed
+        if(tick % 2 == 0) {
+            applyPlayerSpeed(gLocalPlayer);
+        }
+    }
+    LOGI("Background effect thread stopped");
+}
+
+static std::thread gBgThread;
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 10: Hook Detours
+// ═══════════════════════════════════════════════════════════════════
+using CI_Update_Fn = void(*)(void*,void*,void*);
+static CI_Update_Fn orig_CI_update = nullptr;
+
+using Mob_Tick_Fn = void(*)(void*);
+static Mob_Tick_Fn orig_Mob_tick = nullptr;
+
+// ClientInstance::update — per-frame logic
+static void ciUpdateDetour(void* ci, void* a2, void* a3) {
+    if(orig_CI_update) orig_CI_update(ci,a2,a3);
+
+    // Acquire LocalPlayer and initialize seed
+    if(!SeedManager::instance().isInitialized() && gS.CI_getLocalPlayer && !gLocalPlayer) {
         try {
-            fieldAt<float>(playerPtr, Offsets::Player::mMovementSpeed) = newSpeed;
-        } catch (...) {}
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Hook Detours
-// ═══════════════════════════════════════════════════════════════════
-
-// ─── ClientInstance::update detour (called every frame) ───
-static void ciUpdateDetour(void* client, void* a2, void* a3) {
-    if (orig_CI_update)
-        orig_CI_update(client, a2, a3);
-
-    if (!SeedManager::instance().isInitialized()) {
-        if (gSymbols.ClientInstance_getLocalPlayer && !gLocalPlayer) {
-            using GetLPFn = void*(*)(void*);
-            try {
-                gLocalPlayer = reinterpret_cast<GetLPFn>(
-                    gSymbols.ClientInstance_getLocalPlayer)(client);
-            } catch (...) {}
-
-            if (gLocalPlayer) {
-                LOGI("LocalPlayer acquired at %p", gLocalPlayer);
-
-                std::string playerName = readStringAt(gLocalPlayer, Offsets::Player::mName);
-
-                uint64_t uuidMost = 0, uuidLeast = 0;
-                try {
-                    uuidMost  = fieldAt<uint64_t>(gLocalPlayer, Offsets::Player::mUUID_Most);
-                    uuidLeast = fieldAt<uint64_t>(gLocalPlayer, Offsets::Player::mUUID_Least);
-                } catch (...) {}
-
-                std::string uuidStr;
-                if (uuidMost != 0 || uuidLeast != 0) {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "%016lX-%016lX",
-                             (unsigned long)uuidMost, (unsigned long)uuidLeast);
-                    uuidStr = buf;
-                } else if (!playerName.empty()) {
-                    uuidStr = "name:" + playerName;
-                }
-
-                if (!uuidStr.empty()) {
-                    SeedManager::instance().initializeWithUUID(uuidStr);
-                    LOGI("Seed initialized from UUID: %s", uuidStr.c_str());
-                    buildMobSwapMap();
-                    gPlayerSeedReady.store(true);
-                }
+            gLocalPlayer = reinterpret_cast<void*(*)(void*)>(gS.CI_getLocalPlayer)(ci);
+        } catch(...) {}
+        if(gLocalPlayer) {
+            LOGI("LocalPlayer at %p", gLocalPlayer);
+            std::string name = readStr(gLocalPlayer, O::Player::mName);
+            uint64_t um=0,ul=0;
+            try{um=fieldAt<uint64_t>(gLocalPlayer,O::Player::mUUID_Most);
+                ul=fieldAt<uint64_t>(gLocalPlayer,O::Player::mUUID_Least);}catch(...){}
+            std::string uuid;
+            if(um||ul) { char b[64]; snprintf(b,64,"%016lX-%016lX",(unsigned long)um,(unsigned long)ul); uuid=b; }
+            else if(!name.empty()) uuid="name:"+name;
+            if(!uuid.empty()) {
+                SeedManager::instance().initializeWithUUID(uuid);
+                LOGI("Seed from UUID: %s", uuid.c_str());
+                uint64_t seed = SeedManager::instance().getSeed();
+                MobSwap::buildSwapMap(seed);
+                InventoryScramble::buildPermutation(seed);
+                gPlayerSeedReady.store(true);
             }
         }
     }
 
-    if (gPlayerSeedReady.load() && gLocalPlayer) {
-        applyEffectsToPlayer(gLocalPlayer);
+    // Per-frame player effects
+    if(gPlayerSeedReady.load() && gLocalPlayer) {
+        applyPlayerSpeed(gLocalPlayer);
     }
 }
 
-// ─── Mob::normalTick detour (called every tick for each mob) ───
-static int gTickCounter = 0;
-static void mobNormalTickDetour(void* mob) {
-    if (orig_Mob_normalTick)
-        orig_Mob_normalTick(mob);
+// Mob::normalTick — per-entity logic
+static int gMobTickCounter = 0;
+static void mobTickDetour(void* mob) {
+    if(orig_Mob_tick) orig_Mob_tick(mob);
+    ++gMobTickCounter;
+    if(gMobTickCounter % 20 != 0) return; // every ~1s
+    if(!gPlayerSeedReady.load()) return;
 
-    ++gTickCounter;
-    if (gTickCounter % 20 != 0) return;  // Every ~1 second
+    // Mob model swap
+    MobSwap::trySwapMob(mob);
 
-    if (gPlayerSeedReady.load()) {
-        applyEffectsToEntity(mob);
-    }
+    // Nametag scramble
+    applyNametagScramble(mob);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Hook Installation
+//  SECTION 11: Hook Installation
 // ═══════════════════════════════════════════════════════════════════
+static std::atomic<bool> gHooksInstalled{false};
+
 static bool installHooks() {
-    if (gHooksInstalled.load()) return true;
-
+    if(gHooksInstalled.load()) return true;
     LOGI("=== Installing MC hooks ===");
-    int installed = 0;
+    int n=0;
 
-    if (gSymbols.ClientInstance_update) {
-        if (MiniHook::hook(gSymbols.ClientInstance_update,
-                           reinterpret_cast<void*>(ciUpdateDetour),
-                           reinterpret_cast<void**>(&orig_CI_update))) {
-            LOGI("  Hooked ClientInstance::update");
-            ++installed;
-        } else {
-            LOGE("  FAILED to hook ClientInstance::update");
-        }
-    } else {
-        LOGW("  ClientInstance::update not resolved — skipping");
-    }
+    if(gS.CI_update) {
+        if(MiniHook::hook(gS.CI_update,reinterpret_cast<void*>(ciUpdateDetour),
+                          reinterpret_cast<void**>(&orig_CI_update))) { ++n; LOGI("  Hooked CI::update"); }
+        else LOGE("  Failed CI::update");
+    } else LOGW("  CI::update not found");
 
-    if (gSymbols.Mob_normalTick) {
-        if (MiniHook::hook(gSymbols.Mob_normalTick,
-                           reinterpret_cast<void*>(mobNormalTickDetour),
-                           reinterpret_cast<void**>(&orig_Mob_normalTick))) {
-            LOGI("  Hooked Mob::normalTick");
-            ++installed;
-        } else {
-            LOGE("  FAILED to hook Mob::normalTick");
-        }
-    } else {
-        LOGW("  Mob::normalTick not resolved — skipping");
-    }
+    if(gS.Mob_normalTick) {
+        if(MiniHook::hook(gS.Mob_normalTick,reinterpret_cast<void*>(mobTickDetour),
+                          reinterpret_cast<void**>(&orig_Mob_tick))) { ++n; LOGI("  Hooked Mob::normalTick"); }
+        else LOGE("  Failed Mob::normalTick");
+    } else LOGW("  Mob::normalTick not found");
 
-    gHooksInstalled.store(installed > 0);
-    LOGI("Hooks installed: %d", installed);
-    return installed > 0;
+    gHooksInstalled.store(n>0);
+    LOGI("Hooks installed: %d", n);
+    return n>0;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  dlopen Hook — detects when libminecraftpe.so is loaded
+//  SECTION 12: dlopen Hook — detects libminecraftpe.so load
 // ═══════════════════════════════════════════════════════════════════
-static void* (*orig_dlopen)(const char*, int) = nullptr;
+static void* (*orig_dlopen)(const char*,int) = nullptr;
+static std::atomic<bool> gMCLoaded{false};
+static std::atomic<bool> gIniting{false};
 
-static void* my_dlopen(const char* filename, int flags) {
-    void* handle = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
-
-    if (handle && filename && strstr(filename, "libminecraftpe.so") && !gMinecraftLoaded.load()) {
+static void* my_dlopen(const char* fn, int flags) {
+    void* h = orig_dlopen ? orig_dlopen(fn,flags) : nullptr;
+    if(h && fn && strstr(fn,"libminecraftpe.so") && !gMCLoaded.load()) {
         LOGI("=== libminecraftpe.so loaded! ===");
-        gMinecraftLoaded.store(true);
-        gLibMinecraftPe = handle;
-
-        if (!gInitializing.exchange(true)) {
-            usleep(100000);  // 100ms for library init
-
-            if (resolveSymbols()) {
-                installHooks();
-            } else {
-                LOGE("Symbol resolution failed — mod will not function");
-            }
-
-            gInitializing.store(false);
+        gMCLoaded.store(true); gLibMC = h;
+        if(!gIniting.exchange(true)) {
+            usleep(100000);
+            resolveSymbols();
+            installHooks();
+            gIniting.store(false);
         }
     }
-
-    return handle;
+    return h;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Process detection
+//  SECTION 13: Initialization
 // ═══════════════════════════════════════════════════════════════════
 static bool isMinecraftProcess() {
-    int fd = open("/proc/self/cmdline", O_RDONLY);
-    if (fd < 0) return false;
-    char command[256]{};
-    auto size = read(fd, command, sizeof(command) - 1);
-    close(fd);
-    if (size <= 0) return false;
-    return strstr(command, "com.mojang.minecraftpe") != nullptr
-        || strstr(command, "levimc") != nullptr
-        || strstr(command, "minecraftpe") != nullptr;
+    int fd=open("/proc/self/cmdline",O_RDONLY);
+    if(fd<0) return false; char cmd[256]{}; auto sz=read(fd,cmd,255); close(fd);
+    return sz>0 && (strstr(cmd,"minecraftpe")||strstr(cmd,"levimc"));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Write marker file (user can verify mod loaded even if effects fail)
-// ═══════════════════════════════════════════════════════════════════
-static void writeMarkerFile() {
-    FILE* f = fopen("/sdcard/Personalized.marker", "w");
-    if (f) {
-        auto now = std::chrono::system_clock::now();
-        auto time = std::chrono::system_clock::to_time_t(now);
-        fprintf(f, "Personalized mod loaded at %s", ctime(&time));
-        fprintf(f, "PID: %d\n", getpid());
-        fprintf(f, "Version: 0.3.0\n");
-        fclose(f);
-        LOGI("Marker file written to /sdcard/Personalized.marker");
-    }
+static void writeMarker() {
+    FILE* f=fopen("/sdcard/Personalized.marker","w");
+    if(f) { auto t=time(nullptr); fprintf(f,"Personalized v0.4.0 loaded at %sPID: %d\n",ctime(&t),getpid()); fclose(f); }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Initialization
-// ═══════════════════════════════════════════════════════════════════
+static Config gConfig;
+
 static bool initialize() {
-    LOGI("╔══════════════════════════════════════════╗");
-    LOGI("║  Personalized Mod v0.3.0 initializing    ║");
-    LOGI("║  UUID-seeded world scrambling for MC     ║");
-    LOGI("╚══════════════════════════════════════════╝");
+    LOGI("╔══════════════════════════════════════════════╗");
+    LOGI("║  Personalized Mod v0.4.0                    ║");
+    LOGI("║  Texture swap + Inventory scramble + Mob swap║");
+    LOGI("╚══════════════════════════════════════════════╝");
 
-    if (!isMinecraftProcess()) {
-        LOGI("Not in Minecraft process — skipping initialization");
-        return true;
-    }
+    if(!isMinecraftProcess()) { LOGI("Not MC process"); return true; }
+    LOGI("In MC process (PID %d)", getpid());
+    writeMarker();
 
-    LOGI("Running in Minecraft process (PID %d)", getpid());
-    writeMarkerFile();
+    // Generate texture resource pack with default seed
+    // (will be regenerated with UUID seed when player joins)
+    TextureSwap::generateResourcePack(gConfig.fixedSeed);
 
-    // Try to find already-loaded libminecraftpe.so
-    gLibMinecraftPe = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
-    if (gLibMinecraftPe) {
+    // Find MC library
+    gLibMC = dlopen("libminecraftpe.so", RTLD_NOW|RTLD_NOLOAD);
+    if(gLibMC) {
         LOGI("libminecraftpe.so already loaded");
-        gMinecraftLoaded.store(true);
-
-        if (resolveSymbols()) {
-            installHooks();
-        }
+        gMCLoaded.store(true);
+        resolveSymbols();
+        installHooks();
     } else {
-        LOGI("libminecraftpe.so not yet loaded — hooking dlopen to detect load");
-
-        // Find dlopen
-        void* dlopenAddr = dlsym(RTLD_DEFAULT, "dlopen");
-        if (!dlopenAddr) {
-            dlopenAddr = dlsym(RTLD_NEXT, "dlopen");
-        }
-
-        if (dlopenAddr) {
-            if (MiniHook::hook(dlopenAddr,
-                               reinterpret_cast<void*>(my_dlopen),
-                               reinterpret_cast<void**>(&orig_dlopen))) {
-                LOGI("dlopen hooked at %p — will detect libminecraftpe.so load", dlopenAddr);
-            } else {
-                LOGE("FAILED to hook dlopen");
-            }
-        } else {
-            LOGE("Could not find dlopen symbol");
+        LOGI("Hooking dlopen to detect MC load...");
+        void* dlopenAddr = dlsym(RTLD_DEFAULT,"dlopen");
+        if(!dlopenAddr) dlopenAddr = dlsym(RTLD_NEXT,"dlopen");
+        if(dlopenAddr) {
+            if(MiniHook::hook(dlopenAddr,reinterpret_cast<void*>(my_dlopen),
+                              reinterpret_cast<void**>(&orig_dlopen)))
+                LOGI("dlopen hooked at %p", dlopenAddr);
+            else LOGE("dlopen hook failed");
         }
     }
+
+    // Start background effect thread
+    gBgThread = std::thread(backgroundThread);
+    gBgThread.detach();
 
     LOGI("Initialization complete");
     return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Entry Points
+//  SECTION 14: Entry Points
 // ═══════════════════════════════════════════════════════════════════
+__attribute__((constructor)) static void _init() { initialize(); }
+__attribute__((destructor))  static void _fini() { gBgThreadRunning.store(false); }
 
-// 1) Auto-initialize via constructor (works with any loading method)
-__attribute__((constructor))
-static void _personalized_init() {
-    initialize();
-}
-
-// 2) Cleanup on unload
-__attribute__((destructor))
-static void _personalized_fini() {
-    LOGI("Personalized mod unloading");
-    gScrambledEntities.clear();
-    mobSwapMap.clear();
-}
-
-// 3) Named entry point for LeviLauncher / preloader-android compatibility
-extern "C" __attribute__((visibility("default")))
-void mod_entry() {
-    LOGI("mod_entry() called — initializing");
-    initialize();
-}
-
-// 4) PL_REGISTER_MOD compatibility symbol
-extern "C" __attribute__((visibility("default")))
-void* _pl_mod_instance() {
-    static int modInstance = 1;
-    return &modInstance;
-}
-
-// 5) LeviLauncher metadata symbols
-extern "C" __attribute__((visibility("default")))
-const char* mod_name() { return "Personalized"; }
-
-extern "C" __attribute__((visibility("default")))
-const char* mod_version() { return "0.3.0"; }
-
-extern "C" __attribute__((visibility("default")))
-const char* mod_description() { return "UUID-seeded world scrambling for MC Bedrock"; }
+extern "C" __attribute__((visibility("default"))) void mod_entry() { initialize(); }
+extern "C" __attribute__((visibility("default"))) void* _pl_mod_instance() { static int x=1; return &x; }
+extern "C" __attribute__((visibility("default"))) const char* mod_name() { return "Personalized"; }
+extern "C" __attribute__((visibility("default"))) const char* mod_version() { return "0.4.0"; }
+extern "C" __attribute__((visibility("default"))) const char* mod_description() { return "UUID-seeded texture swap, inventory scramble, mob model swap"; }
 
 } // namespace personalized

@@ -1,8 +1,8 @@
 {
     "name": "Personalized",
     "entry": "libPersonalized.so",
-    "version": "0.3.0",
-    "description": "UUID-seeded world scrambling for MC Bedrock — nametag scramble, mob scale change, movement speed alteration. Each player sees a uniquely scrambled world based on their UUID.",
+    "version": "0.4.0",
+    "description": "UUID-seeded texture swap, inventory scramble, mob model swap for MC Bedrock. Each player sees a uniquely scrambled world.",
     "author": "sfdgdrfsrf",
     "license": "GPL-3.0",
     "type": "native",
