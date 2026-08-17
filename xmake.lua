@@ -1,20 +1,18 @@
-/**
- * xmake.lua — Build configuration for Personalized (LeviLamina native mod).
- *
- * Build modes:
- *
- *   1. STANDALONE (stub headers, no SDK — default):
- *        xmake f -p android -a arm64-v8a --ndk=$ANDROID_NDK_ROOT -m release
- *        xmake
- *
- *   2. WITH real LeviLamina SDK:
- *        xmake f -p windows -a x64 -m release --sdk=levilamina
- *        xmake
- *
- *   3. CI / Android cross-compile:
- *        xmake f -p android -a arm64-v8a --ndk=$ANDROID_NDK_ROOT -m release -y
- *        xmake -y
- */
+-- xmake.lua — Build configuration for Personalized (LeviLamina native mod).
+--
+-- Build modes:
+--
+--   1. STANDALONE (stub headers, no SDK — default):
+--        xmake f -p android -a arm64-v8a --ndk=$ANDROID_NDK_ROOT -m release
+--        xmake
+--
+--   2. WITH real LeviLamina SDK:
+--        xmake f -p windows -a x64 -m release --sdk=levilamina
+--        xmake
+--
+--   3. CI / Android cross-compile:
+--        xmake f -p android -a arm64-v8a --ndk=$ANDROID_NDK_ROOT -m release -y
+--        xmake -y
 
 -- ─────────────────────────────────────────────
 --  Project definition
