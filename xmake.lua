@@ -22,6 +22,7 @@ add_requires("nlohmann_json v3.11.3")
 add_requires("fmt")
 add_requires("magic_enum v0.9.7")
 add_requires("glm")
+add_requires("pfr 2.1.1")
 
 target("Personalized")
     set_kind("shared")
@@ -33,7 +34,7 @@ target("Personalized")
     add_includedirs("include", {public = true})
     add_includedirs("src")
 
-    add_packages("preloader", "nlohmann_json", "fmt", "magic_enum", "glm")
+    add_packages("preloader", "nlohmann_json", "fmt", "magic_enum", "glm", "pfr")
 
     if is_plat("android") then
         add_cxflags("-fPIC", "-O2", "-ffunction-sections", "-fdata-sections", "-fexceptions", "-frtti", "-fno-stack-protector", "-w", "-fvisibility=hidden")
