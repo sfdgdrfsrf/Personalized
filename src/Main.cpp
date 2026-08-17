@@ -447,7 +447,7 @@ static void buildPermutation(uint64_t seed) {
     // (hotbar slots 0-8, main inventory 9-35)
     const size_t slotCount = 36;
     gInvPermutation = RandomMapper::partialScramble(
-        seed ^ 0x1NV3NT0RY, slotCount, 0.7, 3);
+        seed ^ 0x1CBE11DAULL, slotCount, 0.7, 3);
     LOGI("Inventory permutation built: %zu slots", slotCount);
 }
 
