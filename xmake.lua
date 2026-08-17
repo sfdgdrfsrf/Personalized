@@ -73,19 +73,19 @@ target("Personalized")
         add_syslinks("log")  -- Android logcat
     elseif is_plat("linux") then
         add_syslinks("pthread", "dl")
-    end()
+    end
 
     -- ── Compiler flags ──
     if is_plat("windows") then
         add_cxxflags("/EHsc", {force = true})
         add_cxflags("/W3", {force = true})
         add_defines("NOMINMAX", "WIN32_LEAN_AND_MEAN")
-    else()
+    else
         -- Clang/GCC flags (Android NDK, Linux, etc.)
         add_cxxflags("-fexceptions", {force = true})
         add_cxxflags("-frtti", {force = true})
         add_cxxflags("-Wall", "-Wextra", "-Wno-unused-parameter", {force = true})
-    end()
+    end
 
     -- Suppress noisy warnings from stub headers
     add_cxxflags("-Wno-unused-function", "-Wno-unused-variable", "-Wno-format", "-Wno-format-extra-args", {force = true})
@@ -95,10 +95,10 @@ target("Personalized")
         add_defines("DEBUG", "_DEBUG")
         if is_plat("windows") then
             add_cxxflags("/Zi", "/Od", {force = true})
-        else()
+        else
             add_cxxflags("-g", "-O0", {force = true})
-        end()
-    end()
+        end
+    end
 
     -- Release-specific
     if is_mode("release") then
@@ -106,23 +106,23 @@ target("Personalized")
         if is_plat("windows") then
             add_cxxflags("/O2", "/GL", {force = true})
             add_ldflags("/LTCG", {force = true})
-        else()
+        else
             add_cxxflags("-O2", {force = true})
-        end()
-    end()
+        end
+    end
 
     -- ── Output configuration ──
     after_build(function (target)
         local output = target:targetdir() .. "/" .. target:basename()
         if is_plat("windows") then
             output = output .. ".dll"
-        else()
+        else
             output = output .. ".so"
         end
         print("Built: " .. output)
         if is_plat("android") then
             print("Deploy to: <device>/plugins/Personalized/Personalized.so")
-        else()
+        else
             print("Deploy to: <server>/plugins/Personalized/Personalized.dll")
         end
     end)
@@ -142,6 +142,6 @@ target("PersonalizedTest")
 
     if is_plat("windows") then
         add_cxxflags("/EHsc", {force = true})
-    else()
+    else
         add_cxxflags("-fexceptions", "-frtti", {force = true})
-    end()
+    end
