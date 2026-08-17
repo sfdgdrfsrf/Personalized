@@ -1,54 +1,28 @@
-name: Build Android Native Mod
+name: Build Android Mod
 on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Android NDK
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r28c
+
+      - name: Build
         run: |
-          ANDROID_ROOT="/usr/local/lib/android/sdk"
-          yes | ${ANDROID_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1
-          ${ANDROID_ROOT}/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653"
-          echo "ANDROID_NDK_ROOT=${ANDROID_ROOT}/ndk/25.2.9519653" >> $GITHUB_ENV
+          xmake f -y -p android -a arm64-v8a -m release --ndk=${{ steps.ndk.outputs.ndk-path }}
+          xmake -y
 
-      - name: Build with NDK clang++
-        run: |
-          NDK=$ANDROID_NDK_ROOT
-          TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
-          CC=$TOOLCHAIN/bin/aarch64-linux-android21-clang
-          CXX=$TOOLCHAIN/bin/aarch64-linux-android21-clang++
-          
-          mkdir -p build/android
-          
-          # Compile all .cpp files
-          SOURCES=$(find src -name '*.cpp')
-          OBJECTS=""
-          for src in $SOURCES; do
-            obj="build/android/$(basename $src .cpp).o"
-            echo "Compiling: $src -> $obj"
-            $CXX -std=c++20 -O2 -fPIC -fexceptions -frtti \
-              -DPERSONALIZED_STANDALONE -DNDEBUG \
-              -Isrc -Iinclude/stubs \
-              -Wall -Wextra -Wno-unused-parameter \
-              -Wno-unused-function -Wno-unused-variable \
-              -Wno-format -Wno-format-extra-args \
-              -c "$src" -o "$obj"
-            OBJECTS="$OBJECTS $obj"
-          done
-          
-          # Link shared library
-          echo "Linking: libPersonalized.so"
-          $CXX -shared -o build/android/libPersonalized.so $OBJECTS -llog
-          
-          echo "Build complete!"
-          ls -lh build/android/libPersonalized.so
-
-      - name: Upload Compiled Binary
+      - name: Upload Mod
         uses: actions/upload-artifact@v4
         with:
           name: Personalized-Android-Mod
-          path: build/android/libPersonalized.so
+          path: build/android/arm64-v8a/release/libPersonalized.so
+          if-no-files-found: error
