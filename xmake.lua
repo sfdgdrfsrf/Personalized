@@ -25,7 +25,6 @@ set_languages("cxx20")
 -- ─────────────────────────────────────────────
 option("sdk")
     set_default("standalone")
-    set_show(true)
     set_description("SDK mode: 'levilamina' for real SDK, 'standalone' for stub headers")
 option_end()
 
