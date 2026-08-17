@@ -1,28 +1,16 @@
 cmake_minimum_required(VERSION 3.22)
-project(Personalized LANGUAGES CXX C)
+project(Personalized LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-
-# ─── Dobby (inline hooking framework for ARM64) ───
-# Expected at vendor/dobby — cloned in CI or as submodule
-if(EXISTS "${CMAKE_SOURCE_DIR}/vendor/dobby/CMakeLists.txt")
-    set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
-    add_subdirectory(vendor/dobby)
-else()
-    message(STATUS "Dobby not at vendor/dobby — attempting FetchContent")
-    include(FetchContent)
-    FetchContent_Declare(dobby
-        GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-        GIT_TAG        master
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_MakeAvailable(dobby)
-endif()
 
 # ─── Main mod shared library ───
+# No external dependencies — uses only NDK system libraries:
+#   - MiniHook: our own ARM64 inline hooker (in Main.cpp)
+#   - dlsym: runtime symbol resolution
+#   - android/log.h: logging to logcat
+#   - sys/mman.h: mprotect for code modification
+
 add_library(Personalized SHARED
     src/Main.cpp
     src/SeedManager.cpp
@@ -32,17 +20,6 @@ add_library(Personalized SHARED
 target_include_directories(Personalized PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
-
-# Dobby header path (may vary depending on how it was brought in)
-if(TARGET dobby)
-    target_link_libraries(Personalized PRIVATE dobby)
-else()
-    # FetchContent puts headers in the fetch content dir
-    target_include_directories(Personalized PRIVATE
-        ${dobby_SOURCE_DIR}/include
-    )
-    target_link_libraries(Personalized PRIVATE dobby)
-endif()
 
 # Android system libraries
 target_link_libraries(Personalized PRIVATE

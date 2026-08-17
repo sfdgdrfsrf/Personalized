@@ -7,11 +7,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone Dobby
-        run: |
-          git clone --depth 1 https://github.com/jmpews/Dobby.git vendor/dobby
-          echo "Dobby cloned: $(ls vendor/dobby/)"
-
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
@@ -42,7 +37,12 @@ jobs:
           echo "Found: $SO_FILE"
           file "$SO_FILE"
           # Verify it's a valid ARM64 shared library
-          readelf -h "$SO_FILE" | grep -E "Machine|Type" || true
+          readelf -h "$SO_FILE" 2>/dev/null | grep -E "Machine|Type" || true
+          # Show exported symbols
+          echo "=== Exported symbols ==="
+          nm -D "$SO_FILE" 2>/dev/null | grep -E "mod_|_personalized|_pl_mod" || true
+          # Show size
+          ls -lh "$SO_FILE"
 
       - name: Upload Mod
         uses: actions/upload-artifact@v4
