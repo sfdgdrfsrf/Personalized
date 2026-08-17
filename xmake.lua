@@ -5,6 +5,8 @@
 add_rules("mode.debug", "mode.release")
 set_policy("package.requires_lock", true)
 
+add_repositories("levimc-repo https://github.com/LiteLDev/xmake-repo.git")
+
 -- Preloader-android provides the mod loading framework (PL_REGISTER_MOD, hooking, etc.)
 package("preloader")
     set_homepage("https://github.com/LiteLDev/preloader-android")
