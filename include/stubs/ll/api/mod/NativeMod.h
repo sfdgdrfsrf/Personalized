@@ -1,19 +1,29 @@
 #pragma once
-
-/**
- * Stub: ll/api/mod/NativeMod.h
- *
- * LeviLamina mod loading infrastructure. Stub for standalone builds.
- */
+#include <string>
+#include <filesystem>
 
 namespace ll::mod {
 
 class NativeMod {
 public:
-    virtual ~NativeMod() = default;
-    virtual void onLoad() {}
-    virtual void onEnable() {}
-    virtual void onDisable() {}
+    static NativeMod* current() { static NativeMod inst; return &inst; }
+
+    std::filesystem::path getConfigDir() const { return "."; }
+    std::filesystem::path getDataDir() const { return "."; }
+
+    class LoggerStub {
+    public:
+        template <typename... Args>
+        void info(Args&&...) {}
+        template <typename... Args>
+        void warn(Args&&...) {}
+        template <typename... Args>
+        void debug(Args&&...) {}
+        template <typename... Args>
+        void error(Args&&...) {}
+    };
+
+    LoggerStub& getLogger() { static LoggerStub s; return s; }
 };
 
 } // namespace ll::mod

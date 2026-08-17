@@ -1,12 +1,22 @@
 #pragma once
 #include <string>
 
-namespace mc {
-
-/// Minimal Player stub for event references
 class Player {
 public:
-    std::string getName() const { return "StubPlayer"; }
-};
+    virtual ~Player() = default;
+    std::string getRealName() const { return "stub"; }
+    struct Uuid { std::string asString() const { return "00000000-0000-0000-0000-000000000000"; } };
+    Uuid getUuid() const { return {}; }
+    bool isPlayer() const { return true; }
+    void kill() {}
+    void refreshInventory() {}
 
-} // namespace mc
+    struct ItemStub {};
+    struct InventoryStub {
+        int getContainerSize() const { return 0; }
+        ItemStub* getItem(int) { static ItemStub s; return &s; }
+        void setItem(int, const ItemStub&) {}
+    };
+    InventoryStub& getInventory() { static InventoryStub s; return s; }
+    void add(const ItemStub&) {}
+};

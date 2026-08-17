@@ -1,30 +1,13 @@
 #pragma once
-
-/**
- * Stub: ll/api/event/EventBus.h
- *
- * Minimal event bus for standalone compilation.
- * Real LeviLamina provides a full event dispatch system.
- */
-
+#include <string>
+#include <vector>
 #include <functional>
 #include <memory>
-#include <type_traits>
-#include <vector>
-#include <string>
+#include "mc/world/actor/Actor.h"
+#include "mc/world/actor/player/Player.h"
 
 namespace ll::event {
 
-/// Base class for all events
-class Event {
-public:
-    virtual ~Event() = default;
-};
-
-/// Opaque listener handle
-using ListenerPtr = std::shared_ptr<void>;
-
-/// Stub EventBus — stores lambdas but never actually fires them
 class EventBus {
 public:
     static EventBus& getInstance() {
@@ -32,21 +15,39 @@ public:
         return inst;
     }
 
-    /// Register a listener for event type T
-    template <typename T, typename F>
-    ListenerPtr emplaceListener(F&& /*func*/) {
-        // In standalone mode, we just return a dummy handle
-        return std::make_shared<int>(0);
+    using ListenerPtr = void*;
+
+    template <typename Event, typename Callback>
+    ListenerPtr emplaceListener(Callback&&) {
+        return nullptr;
     }
 
-    /// Remove a listener
-    template <typename T>
-    void removeListener(ListenerPtr& /*ptr*/) {
-        // No-op
-    }
-
-private:
-    EventBus() = default;
+    template <typename Event>
+    void removeListener(ListenerPtr) {}
 };
+
+namespace player {
+struct PlayerJoinEvent {
+    Player& self() { static Player s; return s; }
+};
+} // namespace player
+
+namespace world {
+struct ActorAddEvent {
+    Actor& self() { static Actor s; return s; }
+};
+} // namespace world
+
+namespace server {
+struct ServerTickEvent {};
+struct ServerStartingEvent {};
+struct ServerStoppingEvent {};
+} // namespace server
+
+using PlayerJoinEvent = player::PlayerJoinEvent;
+using ActorAddEvent = world::ActorAddEvent;
+using ServerTickEvent = server::ServerTickEvent;
+using ServerStartingEvent = server::ServerStartingEvent;
+using ServerStoppingEvent = server::ServerStoppingEvent;
 
 } // namespace ll::event

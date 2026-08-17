@@ -1,22 +1,4 @@
 #pragma once
-
-/**
- * Stub: ll/api/Logger.h — Minimal standalone Logger for compilation without SDK.
- *
- * Accepts fmtlib-style format strings and converts to printf-style at runtime.
- * When building with the real LeviLamina SDK, this file is overridden.
- *
- * Supported format specs (what Personalized uses):
- *   {}        → %s       (strings / generic)
- *   {:d}      → %d       (int)
- *   {:zu}     → %zu      (size_t)
- *   {:016X}   → %016llX  (uint64_t uppercase hex)
- *   {:016x}   → %016llx  (uint64_t lowercase hex)
- *   {:.0f}    → %.0f     (double, 0 decimal places)
- *   {:.2f}    → %.2f     (double, 2 decimal places)
- *   {:p}      → %p       (pointer)
- */
-
 #include <string>
 #include <cstdio>
 #include <cstdint>
@@ -50,13 +32,11 @@ private:
         std::fprintf(stderr, "[%s][%s] ", level, m_name.c_str());
     }
 
-    /// Convert std::string to const char* for printf; pass everything else through
     static const char* cstr(const std::string& s) { return s.c_str(); }
     static const char* cstr(const char* s)        { return s; }
     template <typename T>
     static T cstr(T v) { return v; }
 
-    /// No-arg: print format string with placeholders stripped
     void log(const char* level, const char* fmt) {
         printPrefix(level);
         std::string out;
@@ -72,7 +52,6 @@ private:
         std::fprintf(stderr, "%s\n", out.c_str());
     }
 
-    /// Variadic: convert fmtlib → printf and forward, converting std::string→c_str
     template <typename... Args>
     void log(const char* level, const char* fmt, Args&&... args) {
         printPrefix(level);
@@ -93,23 +72,14 @@ private:
                 while (*p && *p != '}') { spec += *p; ++p; }
                 if (*p == '}') ++p;
 
-                if (spec.empty()) {
-                    result += "%s";
-                } else if (spec == "d") {
-                    result += "%d";
-                } else if (spec == "zu") {
-                    result += "%zu";
-                } else if (spec == "p") {
-                    result += "%p";
-                } else if (spec == "016X") {
-                    result += "%016llX";
-                } else if (spec == "016x") {
-                    result += "%016llx";
-                } else if (spec.size() >= 2 && spec[0] == '.') {
-                    result += "%" + spec;
-                } else {
-                    result += "%" + spec;
-                }
+                if (spec.empty())           result += "%s";
+                else if (spec == "d")       result += "%d";
+                else if (spec == "zu")      result += "%zu";
+                else if (spec == "p")       result += "%p";
+                else if (spec == "016X")    result += "%016llX";
+                else if (spec == "016x")    result += "%016llx";
+                else if (spec.size() >= 2 && spec[0] == '.') result += "%" + spec;
+                else result += "%" + spec;
             } else {
                 result += *p;
                 ++p;
