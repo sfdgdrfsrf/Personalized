@@ -1,185 +1,141 @@
-#include "PersonalizedMod.h"
-#include "Config.h"
-#include "SeedManager.h"
-#include "Utils/Logger.h"
-#include "Utils/RandomMapper.h"
+/**
+ * Main.cpp — Personalized mod entry point for LeviLauncher (Android).
+ *
+ * Uses preloader-android API (PL_REGISTER_MOD, pl::memory::hook, etc.)
+ * to hook into Minecraft Bedrock and apply UUID-seeded visual scrambling.
+ */
 
-#include "ll/api/Config.h"
-#include "ll/api/event/EventBus.h"
-#include "ll/api/event/player/PlayerJoinEvent.h"
-#include "ll/api/event/world/ActorAddEvent.h"
-#include "ll/api/event/server/ServerTickEvent.h"
-#include "ll/api/service/Service.h"
+#include "personalized/Config.hpp"
+#include "personalized/SeedManager.hpp"
+#include "personalized/Signatures.hpp"
+#include "personalized/SDK.hpp"
 
-#include "mc/world/actor/Actor.h"
-#include "mc/world/actor/player/Player.h"
+#include <pl/Mod.hpp>
+#include <pl/Logger.hpp>
+#include <pl/memory/Hook.hpp>
+#include <pl/memory/Signature.hpp>
+#include <pl/Config.hpp>
 
-#include <numeric>
+#include <atomic>
+#include <cstring>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <mutex>
+#include <unistd.h>
 #include <unordered_map>
 
 namespace personalized {
 
 namespace {
-Config config;
-bool mobSwapBuilt = false;
-bool inventoryShuffled = false;
-int tickCounter = 0;
 
-std::unordered_map<std::string, std::string> mobSwapMap;
+// ── Globals ──
+Config                          gConfig;
+std::atomic<bool>               gEnabled{false};
+std::atomic<bool>               gResolved{false};
+std::mutex                      gResolveMutex;
+void*                           gLocalPlayerNative = nullptr;
+bool                            gHooksInstalled = false;
 
+// Resolved function pointers
+using GetLocalPlayerFn = void*(*)(void*);
+GetLocalPlayerFn                gGetLocalPlayerFn = nullptr;
+
+using GetNameTagFn = std::string(*)(void*);
+GetNameTagFn                    gGetNameTagFn = nullptr;
+
+using SetNameTagFn = void(*)(void*, const std::string&);
+SetNameTagFn                    gSetNameTagFn = nullptr;
+
+using IsPlayerFn = bool(*)(void*);
+IsPlayerFn                      gIsPlayerFn = nullptr;
+
+// dlopen hook (detects when libminecraftpe.so is loaded)
+void* (*gDlopenOriginal)(const char*, int) = nullptr;
+pl::memory::HookHandle gDlopenHook;
+
+// ── Signature table (filled at runtime) ──
+std::unordered_map<sigs::Id, std::uintptr_t> gSigAddresses;
+
+// ── Mob swap map ──
 const std::vector<std::string> mobPool = {
-    "minecraft:zombie",
-    "minecraft:skeleton",
-    "minecraft:pig",
-    "minecraft:cow",
-    "minecraft:sheep",
-    "minecraft:chicken",
-    "minecraft:creeper",
-    "minecraft:spider",
-    "minecraft:blaze",
+    "minecraft:zombie",   "minecraft:skeleton",  "minecraft:pig",
+    "minecraft:cow",      "minecraft:sheep",     "minecraft:chicken",
+    "minecraft:creeper",  "minecraft:spider",    "minecraft:blaze",
     "minecraft:enderman",
 };
+std::unordered_map<std::string, std::string> mobSwapMap;
 
-} // namespace
-
-PersonalizedMod& PersonalizedMod::getInstance() {
-    static PersonalizedMod instance;
-    return instance;
+// ── Logger shortcut ──
+auto& logger() {
+    static auto* log = &pl::log::Logger::getOrCreate("Personalized");
+    return *log;
 }
 
-bool PersonalizedMod::load() {
-    auto& logger = getSelf().getLogger();
-    logger.info("Loading Personalized...");
+// ─────────────────────────────────────────────
+//  Signature resolution
+// ─────────────────────────────────────────────
+bool resolveSignatures() {
+    std::lock_guard lock(gResolveMutex);
+    if (gResolved.load(std::memory_order_acquire)) return true;
 
-    auto configFilePath = getSelf().getConfigDir() / "config.json";
-    if (!ll::config::loadConfig(config, configFilePath.string())) {
-        logger.warn("Cannot load config from {}", configFilePath.string());
-        logger.info("Saving default config");
-        ll::config::saveConfig(config, configFilePath.string());
-    }
+    logger().info("Resolving signatures in libminecraftpe.so ...");
 
-    return true;
-}
-
-bool PersonalizedMod::enable() {
-    auto& logger = getSelf().getLogger();
-    auto& bus = ll::event::EventBus::getInstance();
-
-    logger.info("Personalized v0.2.0 — UUID-seeded world scrambling mod");
-
-    if (!config.enabled) {
-        logger.info("Mod disabled in config");
-        return true;
-    }
-
-    // ── 1. PlayerJoinEvent: Capture UUID → seed the mod ──
-    bus.emplaceListener<ll::event::player::PlayerJoinEvent>(
-        [&logger](ll::event::player::PlayerJoinEvent& event) {
-            auto& player = event.self();
-            auto uuid = player.getUuid().asString();
-
-            logger.info("Player {} joining — UUID: {}", player.getRealName(), uuid);
-
-            if (!SeedManager::instance().isInitialized()) {
-                if (config.seedSource == "fixed") {
-                    SeedManager::instance().initializeWithFixedSeed(config.fixedSeed);
-                } else {
-                    SeedManager::instance().initializeWithUUID(uuid);
-                }
-            }
+    for (const auto& def : sigs::definitions) {
+        auto addr = pl::memory::resolveSignature(def.pattern, "libminecraftpe.so");
+        if (addr) {
+            gSigAddresses[def.id] = addr;
+            logger().debug("  Resolved sig {} -> 0x{:X}",
+                           static_cast<int>(def.id), addr);
+        } else {
+            logger().warn("  FAILED to resolve sig {}", static_cast<int>(def.id));
         }
-    );
-
-    // ── 2. ActorAddEvent: Swap mob types on spawn ──
-    if (config.mobModelSwapEnabled) {
-        bus.emplaceListener<ll::event::ActorAddEvent>(
-            [&logger](ll::event::ActorAddEvent& event) {
-                if (!SeedManager::instance().isInitialized()) return;
-                if (mobSwapMap.empty() && !mobSwapBuilt) {
-                    PersonalizedMod::getInstance().buildMobSwapMap();
-                    mobSwapBuilt = true;
-                }
-                if (mobSwapMap.empty()) return;
-
-                auto& actor = event.self();
-                if (actor.isPlayer()) return;
-
-                std::string typeId = actor.getTypeName();
-                auto it = mobSwapMap.find(typeId);
-                if (it == mobSwapMap.end()) return;
-
-                const std::string& replacement = it->second;
-
-                if (config.dryRun) {
-                    logger.info("[DRY] Would swap {} -> {}", typeId, replacement);
-                    return;
-                }
-
-                // Kill original mob and spawn replacement at same position
-                auto pos = actor.getPosition();
-                auto* dim = actor.getDimension();
-                if (!dim) return;
-
-                actor.remove();
-
-                // Spawn replacement entity — client renders new mob's model
-                dim->spawnEntity(replacement, pos);
-
-                logger.debug("Swapped {} -> {} at ({:.0f}, {:.0f}, {:.0f})",
-                             typeId, replacement, pos.x, pos.y, pos.z);
-            }
-        );
-        logger.info("Mob model swap hook installed");
     }
 
-    // ── 3. ServerTickEvent: Inventory scramble after seed is ready ──
-    if (config.inventoryScrambleEnabled) {
-        bus.emplaceListener<ll::event::server::ServerTickEvent>(
-            [&logger](ll::event::server::ServerTickEvent&) {
-                if (inventoryShuffled) return;
-                if (!SeedManager::instance().isInitialized()) return;
+    // Cache commonly-used function pointers
+    if (auto it = gSigAddresses.find(sigs::Id::ClientInstanceGetLocalPlayer); it != gSigAddresses.end())
+        gGetLocalPlayerFn = reinterpret_cast<GetLocalPlayerFn>(it->second);
 
-                ++tickCounter;
-                if (tickCounter < 40) return; // Wait 2 seconds for players to join
+    if (auto it = gSigAddresses.find(sigs::Id::ActorGetNameTag); it != gSigAddresses.end())
+        gGetNameTagFn = reinterpret_cast<GetNameTagFn>(it->second);
 
-                auto* level = ll::service::getLevel();
-                if (!level) return;
+    if (auto it = gSigAddresses.find(sigs::Id::ActorSetNameTag); it != gSigAddresses.end())
+        gSetNameTagFn = reinterpret_cast<SetNameTagFn>(it->second);
 
-                for (auto& player : level->getPlayers()) {
-                    PersonalizedMod::getInstance().shufflePlayerInventory(player);
-                }
+    if (auto it = gSigAddresses.find(sigs::Id::ActorIsPlayer); it != gSigAddresses.end())
+        gIsPlayerFn = reinterpret_cast<IsPlayerFn>(it->second);
 
-                inventoryShuffled = true;
-                logger.info("Inventory scrambled for all players");
-            }
-        );
-        logger.info("Inventory scramble hook installed");
+    bool ok = !gSigAddresses.empty();
+    gResolved.store(ok, std::memory_order_release);
+    logger().info("Signature resolution {} ({} of {} resolved)",
+                  ok ? "OK" : "FAILED", gSigAddresses.size(), sigs::Count);
+    return ok;
+}
+
+// ─────────────────────────────────────────────
+//  dlopen detour — detects MC library load
+// ─────────────────────────────────────────────
+void* dlopenDetour(const char* filename, int flags) {
+    void* handle = gDlopenOriginal ? gDlopenOriginal(filename, flags) : nullptr;
+    if (handle && filename && std::strstr(filename, "libminecraftpe.so")) {
+        logger().info("libminecraftpe.so loaded — resolving signatures");
+        resolveSignatures();
     }
-
-    logger.info("All hooks active");
-    return true;
+    return handle;
 }
 
-bool PersonalizedMod::disable() {
-    getSelf().getLogger().info("Disabling Personalized...");
-    mobSwapMap.clear();
-    mobSwapBuilt = false;
-    inventoryShuffled = false;
-    return true;
-}
-
-void PersonalizedMod::buildMobSwapMap() {
+// ─────────────────────────────────────────────
+//  Build mob swap map from seed
+// ─────────────────────────────────────────────
+void buildMobSwapMap() {
     if (!SeedManager::instance().isInitialized()) return;
 
-    auto& logger = getSelf().getLogger();
     auto rng = SeedManager::instance().createRNG();
     std::mt19937_64 mobRng(SeedManager::instance().getSeed() ^ 0xB0B0FACEDEADBEEFULL);
 
     mobSwapMap.clear();
-
     for (const auto& mobId : mobPool) {
         std::uniform_real_distribution<double> dist(0.0, 1.0);
-        if (dist(mobRng) > config.mobSwapIntensity) continue;
+        if (dist(mobRng) > gConfig.mobSwapIntensity) continue;
 
         std::string selected;
         int attempts = 0;
@@ -189,46 +145,254 @@ void PersonalizedMod::buildMobSwapMap() {
             ++attempts;
         } while (selected == mobId && attempts < 10);
 
-        mobSwapMap[mobId] = selected;
-        logger.debug("Mob swap: {} -> {}", mobId, selected);
+        if (selected != mobId) {
+            mobSwapMap[mobId] = selected;
+            logger().debug("Mob swap: {} -> {}", mobId, selected);
+        }
     }
-
-    logger.info("Mob swap map built: {} entries", mobSwapMap.size());
+    logger().info("Mob swap map: {} entries", mobSwapMap.size());
 }
 
-void PersonalizedMod::shufflePlayerInventory(Player& player) {
-    if (config.dryRun) {
-        getSelf().getLogger().info("[DRY] Would shuffle inventory for {}", player.getRealName());
-        return;
-    }
+// ─────────────────────────────────────────────
+//  Fetch UUID from LocalPlayer object
+// ─────────────────────────────────────────────
+std::string fetchPlayerUUID(void* playerNative) {
+    if (!playerNative) return {};
 
-    std::mt19937_64 invRng(SeedManager::instance().getSeed() ^ 0xC0FFEE0000000000ULL);
+    // Player name is at offset Player::mName — use it as a unique identifier
+    // For a real UUID, we'd need to find the mce::UUID field offset
+    // For now, read the player name and hash it as a pseudo-UUID
+    try {
+        auto& name = sdk::field<std::string>(playerNative, offsets::Player::mName);
+        if (!name.empty()) {
+            // Use name as seed source for now
+            // A real implementation would read the actual UUID field
+            return "name:" + name;
+        }
+    } catch (...) {}
 
-    auto& inventory = player.getInventory();
-    int slotCount = inventory.getContainerSize();
-    if (slotCount <= 0) return;
+    return {};
+}
 
-    // Fisher-Yates shuffle of inventory slots
-    for (int pass = 0; pass < config.inventoryShufflePasses; ++pass) {
-        for (int i = slotCount - 1; i > 0; --i) {
-            std::uniform_int_distribution<int> dist(0, i);
-            int j = dist(invRng);
-            if (i != j) {
-                auto itemA = inventory.getItem(i);
-                auto itemB = inventory.getItem(j);
-                inventory.setItem(i, *itemB);
-                inventory.setItem(j, *itemA);
+// ─────────────────────────────────────────────
+//  ClientInstance::update detour — runs every frame
+// ─────────────────────────────────────────────
+using ClientInstanceUpdateFn = void(*)(void*, void*, void*);
+ClientInstanceUpdateFn gClientInstanceUpdateOriginal = nullptr;
+
+void clientInstanceUpdateDetour(void* client, void* a2, void* a3) {
+    // Call original first
+    if (gClientInstanceUpdateOriginal)
+        gClientInstanceUpdateOriginal(client, a2, a3);
+
+    if (!gEnabled.load()) return;
+
+    // Get local player
+    if (gGetLocalPlayerFn && !gLocalPlayerNative) {
+        gLocalPlayerNative = gGetLocalPlayerFn(client);
+        if (gLocalPlayerNative) {
+            logger().info("LocalPlayer acquired at {}", gLocalPlayerNative);
+
+            // Fetch UUID and initialize seed
+            auto uuid = fetchPlayerUUID(gLocalPlayerNative);
+            if (!uuid.empty() && !SeedManager::instance().isInitialized()) {
+                SeedManager::instance().initializeWithUUID(uuid);
+                logger().info("Seed initialized from UUID: {}", uuid);
+                buildMobSwapMap();
             }
         }
     }
-
-    player.refreshInventory();
-    getSelf().getLogger().debug("Shuffled inventory for {} ({} slots)",
-                                player.getRealName(), slotCount);
 }
+
+// ─────────────────────────────────────────────
+//  Apply nametag scrambling (visible effect!)
+// ─────────────────────────────────────────────
+void applyNametagScramble(void* actorNative) {
+    if (!actorNative || !SeedManager::instance().isInitialized()) return;
+
+    // Skip players
+    if (gIsPlayerFn && gIsPlayerFn(actorNative)) return;
+
+    // Read current nametag
+    std::string nameTag;
+    if (gGetNameTagFn) {
+        try {
+            nameTag = gGetNameTagFn(actorNative);
+        } catch (...) { return; }
+    }
+    if (nameTag.empty()) return;
+
+    // Scramble the name tag using our seed
+    // This is a VISIBLE effect that proves the mod is working!
+    auto rng = SeedManager::instance().createRNG();
+    std::string scrambled = nameTag;
+    // Simple permutation: shift each character
+    uint64_t shift = rng() % 26;
+    for (auto& c : scrambled) {
+        if (c >= 'a' && c <= 'z') c = 'a' + (c - 'a' + shift) % 26;
+        else if (c >= 'A' && c <= 'Z') c = 'A' + (c - 'A' + shift) % 26;
+    }
+
+    // Set the scrambled nametag
+    if (gSetNameTagFn && scrambled != nameTag) {
+        try {
+            gSetNameTagFn(actorNative, scrambled);
+        } catch (...) {}
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Install hooks into MC functions
+// ─────────────────────────────────────────────
+bool installHooks() {
+    if (gHooksInstalled) return true;
+
+    logger().info("Installing hooks ...");
+
+    int installed = 0;
+
+    // Hook ClientInstance::update
+    if (auto it = gSigAddresses.find(sigs::Id::ClientInstanceUpdate); it != gSigAddresses.end()) {
+        auto handle = pl::memory::HookHandle(
+            reinterpret_cast<pl::memory::FuncPtr>(it->second),
+            reinterpret_cast<pl::memory::FuncPtr>(clientInstanceUpdateDetour),
+            reinterpret_cast<pl::memory::FuncPtr*>(&gClientInstanceUpdateOriginal)
+        );
+        if (handle.installed()) {
+            logger().info("  Hooked ClientInstance::update");
+            ++installed;
+        } else {
+            logger().warn("  Failed to hook ClientInstance::update");
+        }
+    }
+
+    gHooksInstalled = (installed > 0);
+    logger().info("Hooks installed: {}", installed);
+    return gHooksInstalled;
+}
+
+// ─────────────────────────────────────────────
+//  Check if we're in the Minecraft process
+// ─────────────────────────────────────────────
+bool isMinecraftProcess() {
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return false;
+    char command[256]{};
+    auto size = read(fd, command, sizeof(command) - 1);
+    close(fd);
+    if (size <= 0) return false;
+    return std::strcmp(command, "com.mojang.minecraftpe") == 0
+        || std::strstr(command, "levimc") != nullptr
+        || std::strstr(command, "minecraftpe") != nullptr;
+}
+
+// ─────────────────────────────────────────────
+//  Load config
+// ─────────────────────────────────────────────
+void loadConfig(const std::filesystem::path& configDir) {
+    auto configPath = configDir / "config.json";
+    try {
+        auto j = pl::config::loadConfig(configPath,
+            pl::reflection::serialize(gConfig));
+        pl::reflection::deserializeTo(gConfig, j);
+        logger().info("Config loaded from {}", configPath.string());
+    } catch (const std::exception& e) {
+        logger().warn("Config load failed: {} — using defaults", e.what());
+    }
+}
+
+} // namespace
+
+// ═══════════════════════════════════════════
+//  Mod class
+// ═══════════════════════════════════════════
+
+class PersonalizedMod {
+public:
+    static PersonalizedMod& instance() {
+        static PersonalizedMod mod;
+        return mod;
+    }
+
+    bool load(pl::mod::ModContext& ctx) {
+        logger().info("Personalized mod loading ...");
+        logger().info("  Mod dir: {}", ctx.modRootPath().string());
+
+        // Load config
+        loadConfig(ctx.configDir());
+
+        if (!isMinecraftProcess()) {
+            logger().info("Not in MC process — skipping hook installation");
+            return true;
+        }
+
+        // Try to resolve signatures if MC is already loaded
+        void* minecraft = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
+        if (minecraft) {
+            resolveSignatures();
+            dlclose(minecraft);
+            return true;
+        }
+
+        // MC not loaded yet — hook dlopen to detect when it loads
+        void* libdl = dlopen("libdl.so", RTLD_NOW);
+        if (libdl) {
+            void* dlopenSym = dlsym(libdl, "dlopen");
+            if (dlopenSym) {
+                gDlopenHook = pl::memory::HookHandle(
+                    dlopenSym,
+                    reinterpret_cast<pl::memory::FuncPtr>(dlopenDetour),
+                    reinterpret_cast<pl::memory::FuncPtr*>(&gDlopenOriginal)
+                );
+                if (gDlopenHook.installed()) {
+                    logger().info("Hooked dlopen — will detect libminecraftpe.so load");
+                }
+            }
+            dlclose(libdl);
+        }
+
+        return true;
+    }
+
+    bool enable(pl::mod::ModContext& ctx) {
+        gEnabled.store(true);
+        logger().info("Personalized mod enabled");
+
+        if (!isMinecraftProcess()) return true;
+
+        // Try to resolve if not done yet
+        if (!gResolved.load()) {
+            void* minecraft = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
+            if (minecraft) {
+                resolveSignatures();
+                dlclose(minecraft);
+            }
+        }
+
+        // Install hooks once signatures are resolved
+        if (gResolved.load()) {
+            installHooks();
+        }
+
+        return true;
+    }
+
+    bool disable(pl::mod::ModContext&) {
+        gEnabled.store(false);
+        gLocalPlayerNative = nullptr;
+        logger().info("Personalized mod disabled");
+        return true;
+    }
+
+    bool unload(pl::mod::ModContext&) {
+        gEnabled.store(false);
+        gDlopenHook.reset();
+        logger().info("Personalized mod unloaded");
+        return true;
+    }
+};
 
 } // namespace personalized
 
-#include "ll/api/memory/Hook.h"
-// LL_REGISTER_MOD: real SDK auto-registers; stub defines it as no-op
-LL_REGISTER_MOD(personalized::PersonalizedMod, personalized::PersonalizedMod::getInstance())
+// ── Register with preloader ──
+PL_REGISTER_MOD(personalized::PersonalizedMod, personalized::PersonalizedMod::instance())

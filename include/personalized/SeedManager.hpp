@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <random>
 #include <string>
-#include <optional>
 #include <mutex>
 
 namespace personalized {
@@ -12,10 +11,10 @@ class SeedManager {
 public:
     static SeedManager& instance();
 
-    /// Initialize with a UUID string (called from PlayerJoinEvent)
+    /// Initialize with a UUID string
     bool initializeWithUUID(const std::string& uuidStr);
 
-    /// Use a fixed seed from config
+    /// Use a fixed seed
     bool initializeWithFixedSeed(uint64_t seed);
 
     bool isInitialized() const;

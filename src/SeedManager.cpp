@@ -1,5 +1,5 @@
-#include "SeedManager.h"
-#include "Utils/Logger.h"
+#include "personalized/SeedManager.hpp"
+#include <pl/Logger.hpp>
 
 namespace personalized {
 
@@ -11,24 +11,22 @@ SeedManager& SeedManager::instance() {
 bool SeedManager::initializeWithUUID(const std::string& uuidStr) {
     std::lock_guard lock(m_mutex);
     if (m_initialized) return true;
-
     m_uuidString = uuidStr;
     m_seed = deriveSeedFromUUID(uuidStr);
     m_initialized = true;
-
-    PZ_LOG_INFO("SeedManager ready — UUID: {}, Seed: 0x{:016X}", m_uuidString, m_seed);
+    pl::log::Logger::getOrCreate("Personalized").info(
+        "SeedManager ready — UUID: {}, Seed: 0x{:016X}", m_uuidString, m_seed);
     return true;
 }
 
 bool SeedManager::initializeWithFixedSeed(uint64_t seed) {
     std::lock_guard lock(m_mutex);
     if (m_initialized) return true;
-
     m_seed = seed;
     m_uuidString = "FIXED";
     m_initialized = true;
-
-    PZ_LOG_INFO("SeedManager ready — fixed seed: 0x{:016X}", m_seed);
+    pl::log::Logger::getOrCreate("Personalized").info(
+        "SeedManager ready — fixed seed: 0x{:016X}", m_seed);
     return true;
 }
 
@@ -53,13 +51,13 @@ std::mt19937_64 SeedManager::createRNG() const {
 }
 
 uint64_t SeedManager::deriveSeedFromUUID(const std::string& uuidStr) {
-    // FNV-1a 64-bit
+    // FNV-1a 64-bit hash
     uint64_t hash = 0xcbf29ce484222325ULL;
     for (char c : uuidStr) {
         hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
         hash *= 0x100000001b3ULL;
     }
-    // Murmur3 finalizer (avalanche)
+    // Murmur3 finalizer for avalanche
     hash ^= hash >> 33;
     hash *= 0xff51afd7ed558ccdULL;
     hash ^= hash >> 33;

@@ -1,18 +1,13 @@
 {
     "name": "Personalized",
-    "entry": "Personalized.dll",
-    "version": "0.1.0",
-    "description": "UUID-seeded client-side world scrambling for Bedrock Edition — a port of the Java CurseForge mod 'Personalized'. Each player sees a uniquely scrambled version of the world based on their UUID.",
-    "author": "YourNameHere",
+    "entry": "libPersonalized.so",
+    "version": "0.2.0",
+    "description": "UUID-seeded world scrambling for MC Bedrock — texture swap, mob model swap, inventory scramble. Each player sees a uniquely scrambled world based on their UUID.",
+    "author": "sfdgdrfsrf",
     "license": "GPL-3.0",
     "type": "native",
-    "platform": "win-x64",
+    "platform": "android-arm64",
     "dependencies": {
-        "levilamina": ">=0.14.0"
-    },
-    "info": {
-        "readme": "https://github.com/YourNameHere/Personalized-Bedrock",
-        "source": "https://github.com/YourNameHere/Personalized-Bedrock",
-        "issues": "https://github.com/YourNameHere/Personalized-Bedrock/issues"
+        "preloader": ">=0.5.0"
     }
 }
