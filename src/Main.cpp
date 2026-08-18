@@ -1081,6 +1081,15 @@ static bool installHooks() {
 static std::atomic<bool> gBgThreadRunning{false};
 static std::atomic<bool> gInitialized{false};
 
+static bool isMinecraftProcess() {
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return false;
+    char cmd[256]{};
+    auto sz = read(fd, cmd, 255);
+    close(fd);
+    return sz > 0 && (strstr(cmd, "minecraftpe") || strstr(cmd, "levimc") || strstr(cmd, "mojang"));
+}
+
 static void backgroundThread() {
     LOGI("Background thread started (PID %d)", getpid());
     gBgThreadRunning.store(true);
@@ -1169,23 +1178,10 @@ static std::thread gBgThread;
 // ═══════════════════════════════════════════════════════════════════
 //  SECTION 13: Initialization
 //
-//  CRASH FIX: Constructor does MINIMAL work:
-//    1. Install signal handler
-//    2. Check if we're in the MC process
-//    3. Start background thread
-//    4. Return immediately
-//
+//  mod_entry() is the ONLY entry point (constructor is no-op).
 //  All heavy work (symbol resolution, hooking, texture pack) happens
-//  in the background thread, not in the constructor.
+//  in the background thread.
 // ═══════════════════════════════════════════════════════════════════
-static bool isMinecraftProcess() {
-    int fd = open("/proc/self/cmdline", O_RDONLY);
-    if (fd < 0) return false;
-    char cmd[256]{};
-    auto sz = read(fd, cmd, 255);
-    close(fd);
-    return sz > 0 && (strstr(cmd, "minecraftpe") || strstr(cmd, "levimc") || strstr(cmd, "mojang"));
-}
 
 static std::atomic<bool> gModEntryCalled{false};
 
