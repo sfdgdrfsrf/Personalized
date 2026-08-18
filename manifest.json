@@ -1,8 +1,8 @@
 {
     "name": "Personalized",
     "entry": "libPersonalized.so",
-    "version": "0.4.0",
-    "description": "UUID-seeded texture swap, inventory scramble, mob model swap for MC Bedrock. Each player sees a uniquely scrambled world.",
+    "version": "0.5.0",
+    "description": "UUID-seeded texture swap, inventory scramble, mob model swap for MC Bedrock. Crash-safe edition with signal handlers, safe memory access, and deferred initialization.",
     "author": "sfdgdrfsrf",
     "license": "GPL-3.0",
     "type": "native",
