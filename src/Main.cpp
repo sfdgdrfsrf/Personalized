@@ -1,5 +1,5 @@
 /**
- * Main.cpp — Personalized mod for MC Bedrock Android (LeviLauncher) v0.5.1
+ * Main.cpp — Personalized mod for MC Bedrock Android (LeviLauncher) v0.6.0
  *
  * CRASH FIXES from v0.4.0 → v0.5.0 → v0.5.1:
  *   v0.5.0:
@@ -31,6 +31,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -557,10 +558,22 @@ static const std::vector<std::string> blockTextures = {
 };
 
 static std::string findMCDataDir() {
+    // Try multiple possible MC Bedrock data directories on Android.
+    // LeviLauncher uses org.levimc.launcher but MC data stays in com.mojang path.
+    // On Android 15+ with scoped storage, /sdcard/Android/data may need MANAGE_EXTERNAL_STORAGE.
     const char* bases[] = {
+        // Standard MC Bedrock paths
         "/sdcard/Android/data/com.mojang.minecraftpe/files/games/com.mojang",
         "/storage/emulated/0/Android/data/com.mojang.minecraftpe/files/games/com.mojang",
+        // LeviLauncher may store MC data under its own package
+        "/sdcard/Android/data/org.levimc.launcher/files/games/com.mojang",
+        "/storage/emulated/0/Android/data/org.levimc.launcher/files/games/com.mojang",
+        // Direct data paths (needs root)
         "/data/data/com.mojang.minecraftpe/files/games/com.mojang",
+        "/data/data/org.levimc.launcher/files/games/com.mojang",
+        // Game pass / alternative stores
+        "/sdcard/Android/data/com.mojang.minecraftpebeta/files/games/com.mojang",
+        // Try finding it by scanning /sdcard/Android/data/
         nullptr
     };
     for (int i = 0; bases[i]; ++i) {
@@ -570,6 +583,32 @@ static std::string findMCDataDir() {
             return bases[i];
         }
     }
+
+    // Last resort: scan /sdcard/Android/data/ for any dir containing games/com.mojang
+    // This handles custom package names or redirected storage
+    const char* scanRoots[] = {
+        "/sdcard/Android/data",
+        "/storage/emulated/0/Android/data",
+        nullptr
+    };
+    for (int r = 0; scanRoots[r]; ++r) {
+        DIR* dir = opendir(scanRoots[r]);
+        if (!dir) continue;
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            std::string candidate = std::string(scanRoots[r]) + "/" + ent->d_name + "/files/games/com.mojang";
+            struct stat st;
+            if (stat(candidate.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                LOGI("Found MC data dir by scan: %s", candidate.c_str());
+                closedir(dir);
+                return candidate;
+            }
+        }
+        closedir(dir);
+    }
+
+    LOGW("MC data dir not found in any known location");
     return {};
 }
 
@@ -688,6 +727,92 @@ static bool generateResourcePack(uint64_t seed) {
 
     LOGI("Texture resource pack generated at %s (%zu texture swaps)",
          packDir.c_str(), blockTextures.size());
+
+    // ── ACTIVATE the pack in Minecraft ──
+    // MC Bedrock only loads packs that are listed in activation JSON files.
+    // We need to add our pack to both:
+    //   1. resource_packs/resource_packs.json (global available packs)
+    //   2. minecraftWorlds/<world>/world_resource_packs.json (per-world active packs)
+
+    // 1. Global resource_packs.json
+    std::string rpJsonPath = mcDir + "/resource_packs/resource_packs.json";
+    {
+        // Read existing file if present, otherwise create new
+        std::string existing;
+        std::ifstream ifs(rpJsonPath);
+        if (ifs.is_open()) {
+            std::stringstream ss;
+            ss << ifs.rdbuf();
+            existing = ss.str();
+        }
+
+        // Check if our pack is already listed
+        if (existing.find(headerUUID) == std::string::npos) {
+            // Append our pack entry
+            std::ostringstream rpj;
+            if (existing.empty() || existing == "[]") {
+                rpj << "[\n";
+            } else {
+                // Remove trailing ] and add comma
+                std::string trimmed = existing;
+                while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == ' ' || trimmed.back() == ']'))
+                    trimmed.pop_back();
+                rpj << trimmed << ",\n";
+            }
+            rpj << "  {\"pack_id\" : \"" << headerUUID << "\", \"version\" : [ 1, 0, 0 ]}\n]";
+            if (writeFile(rpJsonPath, rpj.str())) {
+                LOGI("Added pack to global resource_packs.json");
+            } else {
+                LOGW("Failed to write resource_packs.json");
+            }
+        } else {
+            LOGI("Pack already in resource_packs.json");
+        }
+    }
+
+    // 2. Per-world activation: scan minecraftWorlds/ and add to each world
+    std::string worldsDir = mcDir + "/minecraftWorlds";
+    DIR* wdir = opendir(worldsDir.c_str());
+    if (wdir) {
+        struct dirent* ent;
+        int activated = 0;
+        while ((ent = readdir(wdir)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            std::string wrpPath = worldsDir + "/" + ent->d_name + "/world_resource_packs.json";
+
+            // Read existing
+            std::string existing;
+            std::ifstream ifs(wrpPath);
+            if (ifs.is_open()) {
+                std::stringstream ss;
+                ss << ifs.rdbuf();
+                existing = ss.str();
+            }
+
+            // Check if already there
+            if (existing.find(headerUUID) != std::string::npos) continue;
+
+            // Add our pack
+            std::ostringstream wrpj;
+            if (existing.empty() || existing == "[]") {
+                wrpj << "[\n";
+            } else {
+                std::string trimmed = existing;
+                while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == ' ' || trimmed.back() == ']'))
+                    trimmed.pop_back();
+                wrpj << trimmed << ",\n";
+            }
+            wrpj << "  {\"pack_id\" : \"" << headerUUID << "\", \"version\" : [ 1, 0, 0 ]}\n]";
+            if (writeFile(wrpPath, wrpj.str())) {
+                ++activated;
+            }
+        }
+        closedir(wdir);
+        LOGI("Texture pack activated in %d worlds", activated);
+    } else {
+        LOGW("Could not open worlds directory: %s", worldsDir.c_str());
+    }
+
     return true;
 }
 
@@ -1090,33 +1215,58 @@ static bool isMinecraftProcess() {
     return sz > 0 && (strstr(cmd, "minecraftpe") || strstr(cmd, "levimc") || strstr(cmd, "mojang"));
 }
 
+/// Write a diagnostic progress marker to /sdcard/ so user can see what's happening
+static void writeProgress(const char* phase, const char* detail) {
+    std::string path = "/sdcard/Personalized.progress";
+    std::ofstream f(path, std::ios::app);
+    if (f.is_open()) {
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        f << "[" << ctime(&t) << "] " << phase << ": " << detail << "\n";
+        f.close();
+    }
+}
+
 static void backgroundThread() {
     LOGI("Background thread started (PID %d)", getpid());
     gBgThreadRunning.store(true);
+    writeProgress("START", "Background thread launched");
 
     // Phase 0: Check if we're in the right process
     if (!isMinecraftProcess()) {
         LOGI("Not MC process — background thread exiting");
+        writeProgress("SKIP", "Not MC process");
         gBgThreadRunning.store(false);
         return;
     }
     LOGI("In MC process (PID %d)", getpid());
+    writeProgress("PROCESS", "In MC process");
 
     // Phase 1: Wait for libminecraftpe.so to be loaded
     // (polling instead of dlopen hook — much safer)
     LOGI("Phase 1: Waiting for libminecraftpe.so...");
+    writeProgress("PHASE1", "Waiting for libminecraftpe.so...");
+    int pollCount = 0;
     while (gBgThreadRunning.load()) {
         gLibMC = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
         if (gLibMC) {
             LOGI("libminecraftpe.so found at %p", gLibMC);
+            writeProgress("PHASE1", "libminecraftpe.so found!");
             break;
         }
         // Also check /proc/self/maps as fallback
         auto mi = getModuleInfo("libminecraftpe.so");
         if (mi.base && mi.size) {
-            LOGI("libminecraftpe.so found in maps at %p", mi.base);
+            LOGI("libminecraftpe.so found in maps at %p (size 0x%zx)", mi.base, mi.size);
+            writeProgress("PHASE1", "Found in /proc/self/maps, retrying dlopen...");
             gLibMC = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
-            if (gLibMC) break;
+            if (gLibMC) {
+                writeProgress("PHASE1", "dlopen succeeded!");
+                break;
+            }
+        }
+        if (++pollCount % 10 == 0) {
+            LOGI("Still waiting for libminecraftpe.so... (%d polls)", pollCount);
         }
         usleep(500000);  // 500ms poll interval
     }
@@ -1125,20 +1275,34 @@ static void backgroundThread() {
 
     // Phase 2: Resolve symbols
     LOGI("Phase 2: Resolving symbols...");
+    writeProgress("PHASE2", "Resolving symbols...");
     resolveSymbols();
+    {
+        char buf[256];
+        int n = 0;
+        if (gS.CI_update) ++n; if (gS.CI_getLocalPlayer) ++n; if (gS.Mob_normalTick) ++n;
+        snprintf(buf, sizeof(buf), "Found %d functions, vtables: Actor=%d Mob=%d Player=%d",
+            n, gS.vtbl_Actor?1:0, gS.vtbl_Mob?1:0, gS.vtbl_Player?1:0);
+        writeProgress("PHASE2", buf);
+    }
 
     // Phase 3: Install hooks
     LOGI("Phase 3: Installing hooks...");
+    writeProgress("PHASE3", "Installing hooks...");
     installHooks();
+    writeProgress("PHASE3", gHooksInstalled.load() ? "Hooks installed!" : "No hooks (functions not found or PC-relative)");
 
     // Phase 4: Generate texture resource pack
     LOGI("Phase 4: Generating texture pack...");
+    writeProgress("PHASE4", "Generating texture pack...");
     Config cfg;
-    TextureSwap::generateResourcePack(cfg.fixedSeed);
+    bool texOk = TextureSwap::generateResourcePack(cfg.fixedSeed);
+    writeProgress("PHASE4", texOk ? "Texture pack generated and ACTIVATED" : "Texture pack FAILED (MC dir not found?)");
 
     gInitialized.store(true);
     LOGI("Initialization complete — hooks: %s, symbols resolved",
          gHooksInstalled.load() ? "YES" : "NO (using polling fallback)");
+    writeProgress("DONE", gHooksInstalled.load() ? "Ready with hooks" : "Ready (no hooks - texture pack only)");
 
     // Phase 5: Main effect loop (polling fallback for when hooks fail)
     int tick = 0;
@@ -1227,9 +1391,9 @@ __attribute__((destructor))  static void _fini() { gBgThreadRunning.store(false)
 extern "C" __attribute__((visibility("default"))) void mod_entry() { initialize(); }
 extern "C" __attribute__((visibility("default"))) void* _pl_mod_instance() { static int x = 1; return &x; }
 extern "C" __attribute__((visibility("default"))) const char* mod_name() { return "Personalized"; }
-extern "C" __attribute__((visibility("default"))) const char* mod_version() { return "0.5.1"; }
+extern "C" __attribute__((visibility("default"))) const char* mod_version() { return "0.6.0"; }
 extern "C" __attribute__((visibility("default"))) const char* mod_description() {
-    return "UUID-seeded texture swap, inventory scramble, mob model swap (crash-safe v0.5.1)";
+    return "UUID-seeded texture swap, inventory scramble, mob model swap (v0.6.0 crash-safe)";
 }
 
 } // namespace personalized

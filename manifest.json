@@ -1,8 +1,8 @@
 {
     "name": "Personalized",
     "entry": "libPersonalized.so",
-    "version": "0.5.1",
-    "description": "UUID-seeded texture swap, inventory scramble, mob model swap. Crash-safe v0.5.1: no-op constructor, mod_entry-only init, signal handlers, safe memory access.",
+    "version": "0.6.0",
+    "description": "UUID-seeded texture swap, inventory scramble, mob model swap. v0.6.0: texture pack auto-activation, progress logging, better MC dir detection.",
     "author": "sfdgdrfsrf",
     "license": "GPL-3.0",
     "type": "native",
