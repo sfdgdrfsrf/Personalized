@@ -1,15 +1,21 @@
 /**
- * Main.cpp — Personalized mod for MC Bedrock Android (LeviLauncher) v0.5.0
+ * Main.cpp — Personalized mod for MC Bedrock Android (LeviLauncher) v0.5.1
  *
- * CRASH FIXES from v0.4.0:
+ * CRASH FIXES from v0.4.0 → v0.5.0 → v0.5.1:
+ *   v0.5.0:
  *   - try/catch does NOT catch SIGSEGV on Android (signals != exceptions)
- *   - MiniHook now REJECTS targets with PC-relative instructions instead of
- *     just warning (broken trampolines caused instant crash on dlopen hook)
+ *   - MiniHook now REJECTS targets with PC-relative instructions
  *   - dlopen hook removed entirely — replaced with /proc/self/maps polling
- *   - Constructor does minimal work (just starts background thread)
- *   - SIGSEGV signal handler installed to recover from bad memory access
+ *   - SIGSEGV signal handler + sigsetjmp/siglongjmp recovery
  *   - All pointer dereferences go through safeRead/safeWrite with mincore
- *   - Hardcoded offsets guarded by isValidPtr() checks
+ *   v0.5.1 (CRITICAL):
+ *   - __attribute__((constructor)) is now a COMPLETE NO-OP
+ *     The constructor runs on the linker's thread during call_constructors,
+ *     which is unsafe for ANY work (even logging or thread creation).
+ *     Crash was: constructor -> log -> __vfprintf -> SIGSEGV
+ *   - mod_entry() is the ONLY entry point for initialization
+ *   - isMinecraftProcess() check moved to background thread
+ *   - No work happens until LeviLamina explicitly calls mod_entry()
  *
  * Three UUID-seeded visual effects:
  *   1. Texture swapping — generates resource pack with permuted block textures
@@ -1079,6 +1085,14 @@ static void backgroundThread() {
     LOGI("Background thread started (PID %d)", getpid());
     gBgThreadRunning.store(true);
 
+    // Phase 0: Check if we're in the right process
+    if (!isMinecraftProcess()) {
+        LOGI("Not MC process — background thread exiting");
+        gBgThreadRunning.store(false);
+        return;
+    }
+    LOGI("In MC process (PID %d)", getpid());
+
     // Phase 1: Wait for libminecraftpe.so to be loaded
     // (polling instead of dlopen hook — much safer)
     LOGI("Phase 1: Waiting for libminecraftpe.so...");
@@ -1173,41 +1187,53 @@ static bool isMinecraftProcess() {
     return sz > 0 && (strstr(cmd, "minecraftpe") || strstr(cmd, "levimc") || strstr(cmd, "mojang"));
 }
 
+static std::atomic<bool> gModEntryCalled{false};
+
 static bool initialize() {
-    LOGI("=== Personalized Mod v0.5.0 ===");
-    LOGI("Crash-safe edition: signal handlers + safe memory access + deferred init");
+    // Guard against double-init (constructor + mod_entry both calling)
+    if (gModEntryCalled.exchange(true)) return true;
+
+    LOGI("=== Personalized Mod v0.5.1 ===");
+    LOGI("Crash-safe: no-op constructor + mod_entry init + signal handlers");
 
     // Step 1: Install signal handlers FIRST (before anything else)
     installSignalHandler();
 
-    // Step 2: Check if we're in the right process
-    if (!isMinecraftProcess()) {
-        LOGI("Not MC process — skipping");
-        return true;
-    }
-    LOGI("In MC process (PID %d)", getpid());
-
-    // Step 3: Start background thread — ALL real work happens there
+    // Step 2: Start background thread — ALL real work happens there
+    // isMinecraftProcess() check is inside the thread, not here
     // Do NOT do any symbol resolution, hooking, or file I/O here
     gBgThread = std::thread(backgroundThread);
     gBgThread.detach();
 
-    LOGI("Constructor complete — background thread running");
+    LOGI("mod_entry() complete — background thread running");
     return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════
 //  SECTION 14: Entry Points
+//
+//  CRITICAL: __attribute__((constructor)) is a COMPLETE NO-OP.
+//  The constructor runs on the linker's thread during call_constructors,
+//  which is extremely fragile. ANY work (even a single __android_log_print)
+//  can crash because the runtime may not be fully initialized yet.
+//  The v0.4.0 crash was: constructor -> __android_log_print -> __vfprintf -> SIGSEGV
+//
+//  Instead, ALL initialization happens in mod_entry(), which LeviLamina
+//  calls explicitly AFTER the .so is fully loaded and the runtime is ready.
 // ═══════════════════════════════════════════════════════════════════
-__attribute__((constructor)) static void _init() { initialize(); }
+
+// NO-OP constructor — does absolutely nothing
+// This prevents crashes during call_constructors
+__attribute__((constructor)) static void _init() { /* no-op */ }
 __attribute__((destructor))  static void _fini() { gBgThreadRunning.store(false); }
 
+// mod_entry() is the REAL entry point, called by LeviLamina after .so load
 extern "C" __attribute__((visibility("default"))) void mod_entry() { initialize(); }
 extern "C" __attribute__((visibility("default"))) void* _pl_mod_instance() { static int x = 1; return &x; }
 extern "C" __attribute__((visibility("default"))) const char* mod_name() { return "Personalized"; }
-extern "C" __attribute__((visibility("default"))) const char* mod_version() { return "0.5.0"; }
+extern "C" __attribute__((visibility("default"))) const char* mod_version() { return "0.5.1"; }
 extern "C" __attribute__((visibility("default"))) const char* mod_description() {
-    return "UUID-seeded texture swap, inventory scramble, mob model swap (crash-safe)";
+    return "UUID-seeded texture swap, inventory scramble, mob model swap (crash-safe v0.5.1)";
 }
 
 } // namespace personalized
